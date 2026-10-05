@@ -1,0 +1,7 @@
+.env
+.venv/
+venv314/
+.tmp/
+data/
+__pycache__/
+.pytest_cache/
