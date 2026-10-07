@@ -1,0 +1,20 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Python environments and generated files
+backend/venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local MongoDB and logs
+data/
+*.log
+
+# Editor and operating-system artifacts
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
