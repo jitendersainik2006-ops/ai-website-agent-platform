@@ -6,7 +6,12 @@ from app.security.permissions import require_roles
 from app.services.admin_context_service import public_identity
 from app.services.common import audit, now, object_id, serialize
 from app.services.crud_service import create_record, delete_record, get_record, list_records, update_record
-from app.services.scheduling_service import admin_cancel_appointment, admin_reschedule_appointment
+from app.services.scheduling_service import (
+    admin_cancel_appointment,
+    admin_reschedule_appointment,
+    available_slots,
+    tenant_timezone_name,
+)
 
 admin_bp = Blueprint("admin", __name__, url_prefix="/api/v1/admin")
 WRITE_ROLES = ("owner", "admin", "manager")
@@ -141,6 +146,25 @@ def business_hours():
     return jsonify([serialize(item) for item in records])
 
 
+@admin_bp.get("/availability/slots")
+@require_auth
+def admin_slots():
+    date_text = request.args.get("date")
+    appointment_id = request.args.get("appointment_id")
+    if not date_text:
+        return jsonify({"error": "validation_error", "message": "date is required (YYYY-MM-DD)."}), 400
+    if appointment_id:
+        db = __import__("flask").current_app.extensions["mongo_db"]
+        appt = db.appointments.find_one({"_id": object_id(appointment_id), "tenant_id": object_id(_tenant_id())})
+        if not appt:
+            return jsonify({"error": "not_found", "message": "Appointment was not found."}), 404
+    try:
+        slots = available_slots(_tenant_id(), date_text, exclude_appointment_id=appointment_id)
+    except (ValueError, KeyError):
+        return jsonify({"error": "validation_error", "message": "date must be YYYY-MM-DD."}), 400
+    return jsonify({"slots": slots, "timezone": tenant_timezone_name(_tenant_id())})
+
+
 @admin_bp.route("/availability/blocked", methods=["GET", "POST"])
 @require_auth
 def blocked_times():
@@ -202,6 +226,45 @@ def lead_detail(record_id):
 @require_auth
 def conversations():
     return jsonify(list_records("conversations", _tenant_id()))
+
+
+@admin_bp.get("/customers")
+@require_auth
+def customers():
+    db = __import__("flask").current_app.extensions["mongo_db"]
+    tenant = object_id(_tenant_id())
+    records = []
+    for customer in db.customers.find({"tenant_id": tenant}).sort("created_at", -1):
+        item = serialize(customer)
+        item["conversation_count"] = db.conversations.count_documents({"tenant_id": tenant, "customer_id": customer["customer_id"]})
+        item["appointment_count"] = db.appointments.count_documents({"tenant_id": tenant, "customer_id": customer["customer_id"]})
+        records.append(item)
+    return jsonify(records)
+
+
+@admin_bp.route("/customers/<record_id>", methods=["GET", "PATCH"])
+@require_auth
+def customer_detail(record_id):
+    db = __import__("flask").current_app.extensions["mongo_db"]
+    tenant = object_id(_tenant_id())
+    customer = db.customers.find_one({"_id": object_id(record_id), "tenant_id": tenant})
+    if not customer:
+        return jsonify({"error": "not_found"}), 404
+    if request.method == "PATCH":
+        if g.auth["role"] not in WRITE_ROLES:
+            return jsonify({"error": "forbidden", "message": "You do not have permission for this action."}), 403
+        payload, error = _payload(("status",))
+        if error:
+            return error
+        if payload["status"] not in {"active", "inactive"}:
+            return jsonify({"error": "validation_error", "message": "status must be active or inactive."}), 400
+        db.customers.update_one({"_id": customer["_id"], "tenant_id": tenant}, {"$set": {"status": payload["status"], "updated_at": now()}})
+        customer = db.customers.find_one({"_id": customer["_id"]})
+        audit(tenant, "customer.status_updated", "customer", customer["_id"], {"status": customer["status"]})
+    result = serialize(customer)
+    result["conversations"] = [serialize(item) for item in db.conversations.find({"tenant_id": tenant, "customer_id": customer["customer_id"]}).sort("updated_at", -1)]
+    result["appointments"] = [serialize(item) for item in db.appointments.find({"tenant_id": tenant, "customer_id": customer["customer_id"]}).sort("start_at", -1)]
+    return jsonify(result)
 
 
 @admin_bp.get("/conversations/<record_id>")
@@ -267,7 +330,12 @@ def admin_reschedule(record_id):
         return error
     record, message = admin_reschedule_appointment(_tenant_id(), record_id, payload["start_at"])
     if not record:
-        status = 404 if message == "Appointment was not found." else 409
+        if message == "Appointment was not found.":
+            status = 404
+        elif message in {"A valid appointment start time is required.", "Appointment time must include a timezone."}:
+            status = 400
+        else:
+            status = 409
         return jsonify({"error": "reschedule_unavailable", "message": message}), status
     audit(object_id(_tenant_id()), "appointment.admin_rescheduled", "appointments", object_id(record_id))
     return jsonify(record)

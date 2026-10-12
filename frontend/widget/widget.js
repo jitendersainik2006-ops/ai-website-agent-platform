@@ -1,18 +1,53 @@
 const key = new URLSearchParams(location.search).get('widget_key');
 let conversationId;
 let appointment = null; // Intentionally memory-only: never stored or placed in a URL.
+let businessTimeZone = 'UTC';
 const $ = selector => document.querySelector(selector);
 const msg = (text, who = 'agent') => { const element = document.createElement('div'); element.className = 'msg ' + who; element.textContent = text; $('#messages').append(element); element.scrollIntoView({block: 'nearest'}); };
 const status = (text = '', error = false) => { const element = $('#appointment-status'); element.textContent = text; element.classList.toggle('error', error); };
 const typing = visible => { let element = $('#typing'); if (visible && !element) { element = document.createElement('div'); element.id = 'typing'; element.className = 'typing'; element.innerHTML = '<i></i> Agent is preparing a response'; $('#messages').append(element); element.scrollIntoView({block: 'nearest'}); } if (!visible && element) element.remove(); };
 const req = async (path, options = {}) => { const response = await fetch('/api/v1' + path, {headers: {'Content-Type': 'application/json', 'X-Widget-Key': key}, ...options}); const data = await response.json(); if (!response.ok) throw Error(data.message || 'Request failed'); return data; };
-const dateValue = date => date.toISOString().slice(0, 10);
-const nextBusinessDay = () => { const date = new Date(); do { date.setDate(date.getDate() + 1); } while (date.getDay() === 0 || date.getDay() === 6); return dateValue(date); };
-const slotLabel = slot => new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short', timeZoneName: 'short'}).format(new Date(slot));
+const calendarDateInZone = (date, timeZone) => {
+  const parts = new Intl.DateTimeFormat('en-CA', {timeZone, year: 'numeric', month: '2-digit', day: '2-digit'}).formatToParts(date);
+  const pick = type => parts.find(part => part.type === type).value;
+  return `${pick('year')}-${pick('month')}-${pick('day')}`;
+};
+const weekdayInZone = (date, timeZone) => new Intl.DateTimeFormat('en-US', {timeZone, weekday: 'short'}).format(date);
+const nextOpenCalendarDate = timeZone => {
+  const cursor = new Date();
+  for (let step = 0; step < 16; step += 1) {
+    const candidate = new Date(cursor.getTime() + step * 24 * 60 * 60 * 1000);
+    const weekday = weekdayInZone(candidate, timeZone);
+    if (weekday !== 'Sat' && weekday !== 'Sun') return calendarDateInZone(candidate, timeZone);
+  }
+  return calendarDateInZone(new Date(), timeZone);
+};
+const slotLabel = slot => new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short', timeZone: businessTimeZone, timeZoneName: 'short'}).format(new Date(slot));
+function prepareAppointmentDate() {
+  const input = $('#appointment-date');
+  const min = calendarDateInZone(new Date(), businessTimeZone);
+  input.min = min;
+  if (!input.value || input.value < min) input.value = nextOpenCalendarDate(businessTimeZone);
+}
 
-async function loadSlots() { const date = $('#appointment-date').value; if (!date) return; const response = await req('/public/availability/slots?date=' + encodeURIComponent(date)); const select = $('#appointment-slot'); select.replaceChildren(new Option(response.slots.length ? 'Choose a time' : 'No times available', '')); response.slots.forEach(slot => select.add(new Option(slotLabel(slot), slot))); status(response.slots.length ? `${response.slots.length} available time${response.slots.length === 1 ? '' : 's'} found.` : 'No available times for this date.', !response.slots.length); return response.slots; }
+async function loadSlots() {
+  const date = $('#appointment-date').value;
+  if (!date) return;
+  const isReschedule = $('#appointment-form').dataset.mode === 'reschedule';
+  let path = '/public/availability/slots?date=' + encodeURIComponent(date);
+  if (isReschedule && appointment && appointment.id && appointment.token) {
+    path += '&appointment_id=' + encodeURIComponent(appointment.id) + '&manage_token=' + encodeURIComponent(appointment.token);
+  }
+  const response = await req(path);
+  if (response.timezone) businessTimeZone = response.timezone;
+  const select = $('#appointment-slot');
+  select.replaceChildren(new Option(response.slots.length ? 'Choose a time' : 'No times available', ''));
+  response.slots.forEach(slot => select.add(new Option(slotLabel(slot), slot)));
+  status(response.slots.length ? `${response.slots.length} available time${response.slots.length === 1 ? '' : 's'} found.` : 'No available times for this date.', !response.slots.length);
+  return response.slots;
+}
 function showBooking(mode = 'book') { $('#appointment-panel').hidden = false; $('#appointment-submit').textContent = mode === 'reschedule' ? 'Confirm new time' : 'Confirm appointment'; ['#appointment-name', '#appointment-email', '#appointment-phone'].forEach(selector => { const field = $(selector); field.hidden = mode === 'reschedule'; field.disabled = mode === 'reschedule'; }); $('#appointment-form').dataset.mode = mode; }
-(async () => { $('#appointment-date').value = nextBusinessDay(); try { const data = await req('/public/widget-config'); $('#title').textContent = data.business_name; msg(data.welcome_message); } catch { msg('The assistant is unavailable right now. Please try again later.'); } })();
+(async () => { try { const data = await req('/public/widget-config'); businessTimeZone = data.timezone || 'UTC'; $('#title').textContent = data.business_name; msg(data.welcome_message); } catch { msg('The assistant is unavailable right now. Please try again later.'); } prepareAppointmentDate(); })();
 
 $('#form').onsubmit = async event => { event.preventDefault(); const input = $('#input'); const text = input.value.trim(); if (!text) return; input.value = ''; msg(text, 'visitor'); $('#send').disabled = true; typing(true); try { const result = conversationId ? await req('/public/conversations/' + conversationId + '/messages', {method: 'POST', body: JSON.stringify({message: text})}) : await req('/chat', {method: 'POST', body: JSON.stringify({message: text})}); conversationId = result.conversation_id; msg(result.answer); } catch (error) { msg('I could not send that message. ' + error.message); } finally { typing(false); $('#send').disabled = false; input.focus(); } };
 $('#slots').onclick = async () => { showBooking(); try { await loadSlots(); } catch (error) { status(error.message, true); } };

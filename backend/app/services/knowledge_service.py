@@ -37,7 +37,12 @@ def _published_sources(tenant_id: str) -> list[dict]:
     for faq in db.faqs.find({"tenant_id": tenant, "status": "published"}):
         sources.append({"kind": "faq", "title": faq["question"], "content": faq["answer"]})
     for item in db.knowledge.find({"tenant_id": tenant, "status": "published"}):
-        sources.append({"kind": "knowledge", "title": item["title"], "content": item["content"]})
+        sources.append({
+            "kind": "knowledge",
+            "title": item["title"],
+            "content": item["content"],
+            "source_url": item.get("source_url"),
+        })
     return sources
 
 
@@ -54,10 +59,12 @@ def retrieve(tenant_id: str, question: str, limit: int = 4) -> list[dict]:
         if pricing_question and not (source_words & PRICE_TERMS):
             continue
         score = len(meaningful & source_words) * 3
-        if service_question and source["kind"] in {"service", "faq"}:
+        if service_question and source["kind"] in {"service", "faq", "knowledge"}:
+            if source["kind"] == "service" or (_words(source["title"]) & SERVICE_TERMS):
+                score += 2
             if meaningful & _words(source["title"]):
                 score += 2
-            elif not meaningful:
+            elif not meaningful and (source["kind"] == "service" or (source_words & SERVICE_TERMS)):
                 score += 1
         if pricing_question and source_words & PRICE_TERMS:
             score += 2

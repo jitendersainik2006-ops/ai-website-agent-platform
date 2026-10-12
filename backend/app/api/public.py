@@ -7,7 +7,7 @@ from flask import Blueprint, current_app, g, jsonify, request
 
 from app.services.common import now, object_id, serialize
 from app.services.llm_gateway import respond
-from app.services.scheduling_service import available_slots, cancel_appointment, create_appointment, reschedule_appointment
+from app.services.scheduling_service import available_slots, cancel_appointment, create_appointment, get_managed_appointment, reschedule_appointment, tenant_timezone_name
 
 public_bp = Blueprint("public", __name__, url_prefix="/api/v1")
 _requests = defaultdict(deque)
@@ -93,7 +93,8 @@ def send_message(conversation_id=None):
         conversation = {"tenant_id": g.widget["tenant_id"], "visitor_id": str(payload.get("visitor_id") or secrets.token_urlsafe(16)), "channel": "widget", "status": "open", "created_at": now(), "updated_at": now()}
         conversation["_id"] = db.conversations.insert_one(conversation).inserted_id
     db.messages.insert_one({"tenant_id": g.widget["tenant_id"], "conversation_id": conversation["_id"], "role": "visitor", "content": message.strip(), "created_at": now()})
-    answer = respond(tenant_id, message.strip())
+    history = list(db.messages.find({"tenant_id": g.widget["tenant_id"], "conversation_id": conversation["_id"]}).sort("created_at", -1).limit(8))
+    answer = respond(tenant_id, message.strip(), list(reversed(history)))
     db.messages.insert_one({"tenant_id": g.widget["tenant_id"], "conversation_id": conversation["_id"], "role": "agent", "content": answer["answer"], "citations": answer["citations"], "created_at": now()})
     db.conversations.update_one({"_id": conversation["_id"]}, {"$set": {"updated_at": now()}})
     return jsonify({"conversation_id": str(conversation["_id"]), **answer})
@@ -125,7 +126,16 @@ def create_lead():
 def slots():
     date = request.args.get("date", "")
     try:
-        return jsonify({"slots": available_slots(_tenant_id(), date)})
+        tenant_id = _tenant_id()
+        appointment_id = request.args.get("appointment_id")
+        manage_token = request.args.get("manage_token")
+        exclude_id = None
+        if appointment_id and manage_token:
+            appointment = get_managed_appointment(tenant_id, appointment_id, manage_token)
+            if not appointment:
+                return jsonify({"error": "appointment_not_authorized", "message": "Appointment management is not authorized."}), 403
+            exclude_id = str(appointment["_id"])
+        return jsonify({"slots": available_slots(tenant_id, date, exclude_appointment_id=exclude_id), "timezone": tenant_timezone_name(tenant_id)})
     except (ValueError, KeyError):
         return jsonify({"error": "validation_error", "message": "date must be YYYY-MM-DD."}), 400
 

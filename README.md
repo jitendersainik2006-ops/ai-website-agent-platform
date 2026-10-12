@@ -6,6 +6,7 @@ Local-first multi-tenant MVP for embedding a business AI assistant. Each tenant 
 
 - Argon2 admin passwords and short-lived tenant-aware JWTs.
 - Role-protected admin REST API and strict tenant filters.
+- Customer registration and sign-in with Argon2 password hashes, tenant-bound JWTs, and atomic per-tenant `BI-000001` style identifiers.
 - Business profile, services, FAQs, knowledge, hours, blocked periods, leads, conversations, appointments, and analytics.
 - Safe local knowledge agent. It answers only from tenant-published information and returns an explicit fallback when information is missing.
 - Iframe widget loader: `script src="http://127.0.0.1:5000/widget-loader.js" data-widget-key="..."`.
@@ -27,6 +28,8 @@ Copy-Item .env.example .env
 .\venv314\Scripts\python.exe run.py
 ```
 
+`MONGODB_SERVER_SELECTION_TIMEOUT_MS` defaults to `5000` so an unavailable local or Atlas MongoDB endpoint fails quickly during health checks instead of waiting on a long driver timeout.
+
 Dashboard login: `admin@blackintel.com` / `ChangeMe123!` for local demonstration only. Demo widget key: `demo_black_intel_widget_key`.
 
 Widget test URL: `http://127.0.0.1:5000/widget-frame.html?widget_key=demo_black_intel_widget_key`.
@@ -43,6 +46,8 @@ Run tests:
 
 Admin CRUD: `/api/v1/admin/business`, `/services`, `/faqs`, `/knowledge`, `/business-hours`, `/availability/blocked`, `/leads`, `/conversations`, `/appointments`, `/analytics`, `/widget-config`.
 
+Customer portal: `POST /api/v1/customer/auth/register`, `POST /api/v1/customer/auth/login`, `GET /api/v1/customer/me`, `/dashboard`, `/chat`, `/availability/slots`, and authenticated appointment create, cancel, and reschedule routes. Customer tenant association is resolved from the enabled public widget key at registration/login and then from the validated customer JWT; a request body never supplies a tenant ID.
+
 Appointment administration: `GET /api/v1/admin/appointments/<id>` returns the tenant-scoped appointment, history, and linked lead without a management-token digest. Owners, admins, and managers can use `POST /api/v1/admin/appointments/<id>/cancel` and `POST /api/v1/admin/appointments/<id>/reschedule` with `{"start_at":"ISO-8601 time with timezone"}`. Both reuse the server-side slot rules, audit trail, calendar adapter, and notification lifecycle.
 
 Public widget: `/api/v1/public/widget-config`, `/public/conversations`, `/public/conversations/<id>/messages`, `/api/v1/chat`, `/public/leads`, `/public/availability/slots`, `/public/appointments`.
@@ -52,6 +57,8 @@ New bookings return a one-time `manage_token`. Keep it only with the visitor's b
 ## Security Notes
 
 Admin tenant identity comes only from validated JWT plus an active database membership. Public endpoints resolve tenants only from an enabled widget public key and optional origin allow-list. Browser code never receives MongoDB or JWT secrets. Appointment token digests and password hashes are filtered from serialized API responses. Basic `nosniff`, referrer, and browser-permission headers are included without blocking the iframe embed. `.env`, virtual environments, caches, and database folders are ignored by Git.
+
+Customer tokens use a separate `subject_type=customer` claim and cannot authenticate to administrator APIs. A customer can access only conversations and appointments carrying that customer's issued ID within the token's active tenant. Administrators can review tenant-local customer records and deactivate accounts; deactivation invalidates existing customer tokens on their next request.
 
 Admin write operations are audited, including business profile, business-hours, widget configuration, blocked availability, leads, and appointment lifecycle changes. Configure `SECRET_KEY` and `JWT_SECRET_KEY` to strong, different values before any non-local deployment; do not use the seeded demo password or widget key outside local testing.
 

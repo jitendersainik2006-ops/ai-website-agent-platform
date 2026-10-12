@@ -1,5 +1,19 @@
 const $ = selector => document.querySelector(selector);
-let token = localStorage.agentToken || '';
+// Do not let historical persistent browser tokens bypass the login-first screen.
+localStorage.removeItem('agentToken');
+localStorage.removeItem('customerToken');
+let token = sessionStorage.agentToken || '';
+let customerToken = sessionStorage.customerToken || '';
+const customerWidgetKey = 'demo_black_intel_widget_key';
+let customerConversationId = null;
+let customerRescheduleAppointmentId = null;
+document.querySelectorAll('.brand').forEach(brand => { const mark = brand.querySelector('.brand-mark'); const label = brand.querySelector('span:last-child'); if (mark) mark.textContent = 'BI'; if (label) label.textContent = 'BLACK INTEL'; });
+const landingPrimary = document.querySelector('.hero-actions .button-primary');
+if (landingPrimary) { landingPrimary.classList.remove('open-login'); landingPrimary.classList.add('open-customer'); landingPrimary.dataset.customerMode = 'login'; landingPrimary.textContent = 'Customer login'; }
+const finalAction = document.querySelector('.final-cta .button-primary');
+if (finalAction) { finalAction.classList.remove('open-login'); finalAction.classList.add('open-customer'); finalAction.dataset.customerMode = 'register'; finalAction.textContent = 'Create your account'; }
+const previewAgent = document.querySelector('.preview-message.agent b');
+if (previewAgent) previewAgent.textContent = 'Black Intel Agent';
 let canWrite = false;
 let currentView = 'overview';
 
@@ -10,15 +24,43 @@ const api = async (path, options = {}) => {
   return data;
 };
 const esc = value => String(value || '').replace(/[&<>"']/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char]));
-const dateTime = value => value ? new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'}).format(new Date(value)) : 'Not recorded';
+let customerTimeZone = 'UTC';
+const calendarDateInZone = (date, timeZone) => {
+  const parts = new Intl.DateTimeFormat('en-CA', {timeZone, year: 'numeric', month: '2-digit', day: '2-digit'}).formatToParts(date);
+  const pick = type => parts.find(part => part.type === type).value;
+  return `${pick('year')}-${pick('month')}-${pick('day')}`;
+};
+const weekdayInZone = (date, timeZone) => new Intl.DateTimeFormat('en-US', {timeZone, weekday: 'short'}).format(date);
+const nextOpenCalendarDate = timeZone => {
+  const cursor = new Date();
+  for (let step = 0; step < 16; step += 1) {
+    const candidate = new Date(cursor.getTime() + step * 24 * 60 * 60 * 1000);
+    const weekday = weekdayInZone(candidate, timeZone);
+    if (weekday !== 'Sat' && weekday !== 'Sun') return calendarDateInZone(candidate, timeZone);
+  }
+  return calendarDateInZone(new Date(), timeZone);
+};
+const dateTime = (value, timeZone) => value ? new Intl.DateTimeFormat(undefined, {year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: timeZone || undefined, timeZoneName: timeZone ? 'short' : undefined}).format(new Date(value)) : 'Not recorded';
+const wallTimeInZoneToIso = (localValue, timeZone) => {
+  const match = String(localValue || '').match(/^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})/);
+  if (!match) return new Date(localValue).toISOString();
+  const utcGuess = Date.UTC(Number(match[1].slice(0, 4)), Number(match[1].slice(5, 7)) - 1, Number(match[1].slice(8, 10)), Number(match[2]), Number(match[3]), 0);
+  const offsetParts = new Intl.DateTimeFormat('en-US', {timeZone, timeZoneName: 'longOffset', hour: 'numeric'}).formatToParts(new Date(utcGuess));
+  const tzName = (offsetParts.find(part => part.type === 'timeZoneName') || {}).value || 'GMT';
+  const offsetMatch = tzName.match(/GMT([+-])(\d{1,2})(?::(\d{2}))?/i);
+  if (!offsetMatch) return new Date(localValue).toISOString();
+  const sign = offsetMatch[1] === '-' ? -1 : 1;
+  const offsetMinutes = sign * (Number(offsetMatch[2]) * 60 + Number(offsetMatch[3] || 0));
+  return new Date(utcGuess - offsetMinutes * 60 * 1000).toISOString();
+};
 const statusBadge = status => `<span class="status-badge ${esc(status || '').toLowerCase()}">${esc(status || 'active')}</span>`;
 const empty = (title, text) => `<div class="panel empty-state"><h3>${esc(title)}</h3><p>${esc(text)}</p></div>`;
 const loading = () => '<div class="panel empty-state"><h3>Loading workspace data</h3><p>Please wait a moment.</p></div>';
 function notice(text, isError = false) { const target = $('#notice'); target.textContent = text; target.style.color = isError ? 'var(--danger)' : 'var(--accent)'; if (text) setTimeout(() => { if (target.textContent === text) target.textContent = ''; }, 4200); }
 function setBusy(button, busy, text) { if (!button) return; button.disabled = busy; button.dataset.label ||= button.textContent; button.textContent = busy ? text : button.dataset.label; }
 function setActive(view) { document.querySelectorAll('.nav-item').forEach(button => button.classList.toggle('active', button.dataset.view === view)); }
-function showLogin() { $('#landing').hidden = true; $('#login').hidden = false; $('#app').hidden = true; }
-function showLanding() { $('#landing').hidden = false; $('#login').hidden = true; $('#app').hidden = true; }
+function showLogin() { document.body.classList.add('customer-auth-active'); $('#landing').hidden = true; $('#login').hidden = false; $('#app').hidden = true; $('#customer-auth').hidden = true; $('#customer-app').hidden = true; }
+function showLanding() { showCustomerAuth('login'); }
 
 async function login(event) {
   event.preventDefault();
@@ -27,7 +69,7 @@ async function login(event) {
   setBusy(submit, true, 'Verifying access...'); spinner.hidden = false; $('#login-error').textContent = '';
   try {
     const result = await api('/auth/login', {method: 'POST', body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget)))});
-    token = result.access_token; localStorage.agentToken = token; await boot();
+    token = result.access_token; sessionStorage.agentToken = token; await boot();
   } catch (error) { $('#login-error').textContent = error.message; }
   finally { setBusy(submit, false); spinner.hidden = true; }
 }
@@ -35,10 +77,11 @@ async function boot() {
   try {
     const identity = await api('/admin/context');
     canWrite = ['owner', 'admin', 'manager'].includes(identity.role);
+    document.body.classList.add('customer-auth-active');
     $('#landing').hidden = true; $('#login').hidden = true; $('#app').hidden = false;
     $('#tenant-name').textContent = identity.tenant.name;
     await show('overview');
-  } catch { localStorage.removeItem('agentToken'); token = ''; showLogin(); }
+  } catch { sessionStorage.removeItem('agentToken'); token = ''; showLogin(); }
 }
 function details(title, value) { return `<div class="panel"><p class="eyebrow">Record intelligence</p><h3>${esc(title)}</h3><pre>${esc(JSON.stringify(value, null, 2))}</pre></div>`; }
 function bindCrud(view, fields, root, items) {
@@ -51,19 +94,134 @@ function bindCrud(view, fields, root, items) {
 }
 async function showAppointments(root) {
   const items = await api('/admin/appointments');
-  root.innerHTML = `<div class="page-heading"><p class="eyebrow">Scheduling operations</p><h2>Appointments</h2><p>Monitor meetings confirmed through the website agent.</p></div><div class="panel"><div class="list-title"><h3>All appointments</h3><span>${items.length} total</span></div>${items.length ? items.map(item => `<div class="row appointment-row"><span><b>${statusBadge(item.status)} ${esc(dateTime(item.start_at))}</b><br><small>${esc(item.timezone || 'Configured tenant time')}</small></span><button class="detail" data-id="${item._id}">Review</button></div>`).join('') : empty('No appointments yet', 'Confirmed visitor meetings will appear here.')}</div><div id="details"></div>`;
+  root.innerHTML = `<div class="page-heading"><p class="eyebrow">Scheduling operations</p><h2>Appointments</h2><p>Monitor meetings confirmed through the website agent.</p></div><div class="panel"><div class="list-title"><h3>All appointments</h3><span>${items.length} total</span></div>${items.length ? items.map(item => `<div class="row appointment-row"><span><b>${statusBadge(item.status)} ${esc(dateTime(item.start_at, item.timezone))}</b><br><small>${esc(item.timezone || 'Configured tenant time')}</small></span><button class="detail" data-id="${item._id}">Review</button></div>`).join('') : empty('No appointments yet', 'Confirmed visitor meetings will appear here.')}</div><div id="details"></div>`;
   root.querySelectorAll('.detail').forEach(button => button.onclick = async () => {
     $('#details').innerHTML = loading();
-    const appointment = await api('/admin/appointments/' + button.dataset.id);
-    const controls = canWrite && appointment.status !== 'cancelled' ? `<div class="panel inline"><button id="admin-cancel" class="danger" type="button">Cancel appointment</button><input id="admin-time" type="datetime-local" aria-label="New appointment time"><button id="admin-reschedule" type="button">Reschedule</button></div>` : '';
-    $('#details').innerHTML = details('Appointment details and history', appointment) + controls;
-    if (!canWrite || appointment.status === 'cancelled') return;
-    $('#admin-cancel').onclick = async () => { if (!confirm('Cancel this appointment?')) return; await api('/admin/appointments/' + appointment._id + '/cancel', {method: 'POST'}); notice('Appointment cancelled.'); show('appointments'); };
-    $('#admin-reschedule').onclick = async () => { const value = $('#admin-time').value; if (!value) return notice('Choose a new date and time.', true); await api('/admin/appointments/' + appointment._id + '/reschedule', {method: 'POST', body: JSON.stringify({start_at: new Date(value).toISOString()})}); notice('Appointment rescheduled.'); show('appointments'); };
+    try {
+      const [appointment, business] = await Promise.all([
+        api('/admin/appointments/' + button.dataset.id),
+        api('/admin/business').catch(() => ({}))
+      ]);
+      const duration = Number(business?.appointment_duration_minutes) || 30;
+      const buffer = Number(business?.appointment_buffer_minutes) || 0;
+      const apptTz = appointment.timezone || business?.timezone || 'UTC';
+      const defaultDate = calendarDateInZone(new Date(appointment.start_at), apptTz);
+      const controls = canWrite && appointment.status !== 'cancelled' ? `
+<div class="panel">
+  <p class="eyebrow">Appointment management</p>
+  <h3>Reschedule or cancel meeting</h3>
+  <div class="row">
+    <label style="flex:1">Date for offered slots
+      <input id="admin-reschedule-date" type="date" value="${esc(defaultDate)}" aria-label="Reschedule date">
+    </label>
+    <label style="flex:1">Offered slots
+      <select id="admin-slot" aria-label="Offered slots">
+        <option value="">Loading offered slots...</option>
+      </select>
+    </label>
+  </div>
+  <div class="row">
+    <label style="flex:1">Manual date &amp; time entry
+      <input id="admin-time" type="datetime-local" step="${duration * 60}" aria-label="New appointment time">
+    </label>
+    <div style="display:flex;gap:8px;align-items:flex-end">
+      <button id="admin-reschedule" type="button">Reschedule</button>
+      <button id="admin-cancel" class="danger" type="button">Cancel appointment</button>
+    </div>
+  </div>
+  <p class="muted small" id="admin-reschedule-guidance">
+    Configured slot duration is ${duration} minutes${buffer ? ` (${buffer} min buffer)` : ''}. Choose an offered slot above or specify a time aligning with configured slot intervals and business hours.
+  </p>
+</div>` : '';
+      $('#details').innerHTML = details('Appointment details and history', appointment) + controls;
+      if (!canWrite || appointment.status === 'cancelled') return;
+
+      const loadSlots = async (dateStr) => {
+        const select = $('#admin-slot');
+        if (!select) return;
+        select.disabled = true;
+        select.innerHTML = '<option value="">Loading offered slots...</option>';
+        try {
+          const response = await api('/admin/availability/slots?date=' + encodeURIComponent(dateStr) + '&appointment_id=' + appointment._id);
+          const slots = Array.isArray(response) ? response : (response.slots || []);
+          if (!slots.length) {
+            select.innerHTML = '<option value="">No offered slots on this date</option>';
+          } else {
+            select.innerHTML = '<option value="">Select an offered slot...</option>' + slots.map(s => `<option value="${esc(s)}">${esc(dateTime(s, apptTz))}</option>`).join('');
+          }
+        } catch (err) {
+          select.innerHTML = `<option value="">Unable to load slots: ${esc(err.message)}</option>`;
+        } finally {
+          select.disabled = false;
+        }
+      };
+
+      if ($('#admin-reschedule-date')) {
+        $('#admin-reschedule-date').onchange = () => {
+          const d = $('#admin-reschedule-date').value;
+          if (d) loadSlots(d);
+        };
+        await loadSlots(defaultDate);
+      }
+      if ($('#admin-slot') && $('#admin-time')) {
+        $('#admin-slot').onchange = () => {
+          if ($('#admin-slot').value) $('#admin-time').value = '';
+        };
+        $('#admin-time').oninput = () => {
+          if ($('#admin-time').value) $('#admin-slot').value = '';
+        };
+      }
+
+      $('#admin-cancel').onclick = async () => {
+        if (!confirm('Cancel this appointment?')) return;
+        const btn = $('#admin-cancel');
+        setBusy(btn, true, 'Cancelling...');
+        try {
+          await api('/admin/appointments/' + appointment._id + '/cancel', {method: 'POST'});
+          notice('Appointment cancelled.');
+          await show('appointments');
+        } catch (error) {
+          notice(error.message, true);
+        } finally {
+          setBusy(btn, false);
+        }
+      };
+
+      $('#admin-reschedule').onclick = async () => {
+        const btn = $('#admin-reschedule');
+        const slotValue = $('#admin-slot')?.value;
+        const timeValue = $('#admin-time')?.value;
+        let chosenIso = '';
+        if (slotValue) {
+          chosenIso = slotValue;
+        } else if (timeValue) {
+          chosenIso = wallTimeInZoneToIso(timeValue, apptTz);
+        } else {
+          return notice('Choose an offered slot or enter a new date and time.', true);
+        }
+        setBusy(btn, true, 'Rescheduling...');
+        try {
+          await api('/admin/appointments/' + appointment._id + '/reschedule', {
+            method: 'POST',
+            body: JSON.stringify({start_at: chosenIso})
+          });
+          notice('Appointment rescheduled.');
+          await show('appointments');
+        } catch (error) {
+          notice(error.message, true);
+        } finally {
+          setBusy(btn, false);
+        }
+      };
+    } catch (error) {
+      $('#details').innerHTML = `<div class="panel empty-state"><h3>Unable to load appointment</h3><p>${esc(error.message)}</p></div>`;
+      notice(error.message, true);
+    }
   });
 }
 async function showAvailability(root) {
-  const [hours, blocks] = await Promise.all([api('/admin/business-hours'), api('/admin/availability/blocked')]);
+  const [hours, blocks, business] = await Promise.all([api('/admin/business-hours'), api('/admin/availability/blocked'), api('/admin/business')]);
+  const businessTimeZone = business.timezone || 'UTC';
   const byDay = new Map(hours.map(hour => [hour.weekday, hour])); const names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
   const hourRows = Array.from({length: 7}, (_, weekday) => { const hour = byDay.get(weekday) || {enabled: false, start_time: '09:00', end_time: '17:00'}; return `<div class="row"><label><input type="checkbox" data-enabled="${weekday}" ${hour.enabled ? 'checked' : ''}> ${names[weekday]}</label><input type="time" data-start="${weekday}" value="${esc(hour.start_time)}"><input type="time" data-end="${weekday}" value="${esc(hour.end_time)}"></div>`; }).join('');
   const hoursEditor = canWrite ? `<form id="hours-form" class="panel"><p class="eyebrow">Scheduling policy</p><h3>Working hours</h3>${hourRows}<button type="submit">Save working hours</button></form>` : `<div class="panel"><h3>Working hours</h3>${hours.map(hour => `<div class="row"><span>${names[hour.weekday]}<br><small>${esc(hour.start_time)} to ${esc(hour.end_time)}</small></span>${statusBadge(hour.enabled ? 'enabled' : 'disabled')}</div>`).join('') || empty('No working hours', 'No availability windows are currently configured.')}</div>`;
@@ -71,12 +229,13 @@ async function showAvailability(root) {
   root.innerHTML = `<div class="page-heading"><p class="eyebrow">Availability intelligence</p><h2>Availability</h2><p>Define working windows and protect unavailable periods from booking.</p></div>${hoursEditor}${blockForm}<div class="panel"><div class="list-title"><h3>Blocked periods</h3><span>${blocks.length} active</span></div>${blocks.length ? blocks.map(block => `<div class="row"><span><b>${esc(dateTime(block.start_at))}</b><br><small>Until ${esc(dateTime(block.end_at))}</small></span>${canWrite ? `<button class="danger unblock" data-id="${block._id}">Remove</button>` : ''}</div>`).join('') : empty('No blocked periods', 'Your current working-hour windows are available for scheduling.')}</div>`;
   if (!canWrite) return;
   $('#hours-form').onsubmit = async event => { event.preventDefault(); const hours = Array.from({length: 7}, (_, weekday) => ({weekday, enabled: $(`[data-enabled="${weekday}"]`).checked, start_time: $(`[data-start="${weekday}"]`).value, end_time: $(`[data-end="${weekday}"]`).value})); if (hours.some(item => !item.start_time || !item.end_time || item.start_time >= item.end_time)) return notice('Each day needs a valid start and end time.', true); await api('/admin/business-hours', {method: 'PUT', body: JSON.stringify({hours})}); notice('Working hours saved.'); show('availability'); };
-  $('#block-form').onsubmit = async event => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); data.start_at = new Date(data.start_at).toISOString(); data.end_at = new Date(data.end_at).toISOString(); await api('/admin/availability/blocked', {method: 'POST', body: JSON.stringify(data)}); notice('Blocked period added.'); show('availability'); };
+  $('#block-form').onsubmit = async event => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); data.start_at = wallTimeInZoneToIso(data.start_at, businessTimeZone); data.end_at = wallTimeInZoneToIso(data.end_at, businessTimeZone); await api('/admin/availability/blocked', {method: 'POST', body: JSON.stringify(data)}); notice('Blocked period added.'); show('availability'); };
   root.querySelectorAll('.unblock').forEach(button => button.onclick = async () => { await api('/admin/availability/blocked/' + button.dataset.id, {method: 'DELETE'}); notice('Blocked period removed.'); show('availability'); });
 }
 async function show(view) {
   currentView = view; setActive(view); const root = $('#view'); root.innerHTML = loading(); $('#app').classList.remove('nav-open');
   try {
+    if (view === 'customers') { const items = await api('/admin/customers'); root.innerHTML = `<div class="page-heading"><p class="eyebrow">Client operations</p><h2>Customers</h2><p>Review customer accounts, history, and access status for this tenant.</p></div><div class="panel"><div class="list-title"><h3>Customer directory</h3><span>${items.length} records</span></div>${items.length ? items.map(item => `<div class="row"><span><b>${esc(item.full_name)} · ${esc(item.customer_id)}</b><br><small>${item.conversation_count} conversations · ${item.appointment_count} appointments</small></span><div>${statusBadge(item.status)} ${canWrite ? `<button class="detail customer-status" data-id="${item._id}" data-status="${item.status}">${item.status === 'active' ? 'Suspend' : 'Restore'}</button>` : ''}</div></div>`).join('') : empty('No customers yet', 'Customer accounts will appear here after registration.')}</div>`; root.querySelectorAll('.customer-status').forEach(button => button.onclick = async () => { const status = button.dataset.status === 'active' ? 'inactive' : 'active'; await api('/admin/customers/' + button.dataset.id, {method: 'PATCH', body: JSON.stringify({status})}); notice(`Customer ${status === 'active' ? 'restored' : 'suspended'}.`); show('customers'); }); return; }
     if (view === 'overview') { const data = await api('/admin/analytics'); root.innerHTML = `<div class="page-heading"><p class="eyebrow">Command overview</p><h2>Website agent performance</h2><p>Real-time tenant-scoped activity from your website operation.</p></div><div class="grid">${[['Conversations', data.total_conversations], ['Leads', data.total_leads], ['Appointments', data.total_appointments], ['Conversion', data.conversion_rate + '%']].map(([label, value]) => `<div class="metric"><small>${label}</small><b>${value}</b></div>`).join('')}</div><div class="dashboard-split"><div class="panel"><h3>Recent leads</h3>${data.recent_leads?.length ? data.recent_leads.map(lead => `<div class="row"><span><b>${esc(lead.name || lead.email || 'Website visitor')}</b><br><small>${esc(lead.requirement || lead.email || '')}</small></span>${statusBadge(lead.status)}</div>`).join('') : empty('No recent leads', 'Qualified visitors will appear here.')}</div><div class="panel"><h3>Upcoming appointments</h3>${data.recent_appointments?.length ? data.recent_appointments.map(appointment => `<div class="row"><span><b>${esc(dateTime(appointment.start_at))}</b><br><small>${esc(appointment.status)}</small></span>${statusBadge(appointment.status)}</div>`).join('') : empty('No appointments yet', 'Booked meetings will appear here.')}</div></div>`; return; }
     if (view === 'business') { const data = await api('/admin/business'); root.innerHTML = `<div class="page-heading"><p class="eyebrow">Tenant configuration</p><h2>Business profile</h2><p>Keep the agent's identity and contact information current.</p></div><form class="panel profile-form" id="business-form"><label>Business name<input name="name" value="${esc(data.name)}" ${canWrite ? '' : 'disabled'}></label><label>Contact email<input name="contact_email" type="email" value="${esc(data.contact_email)}" ${canWrite ? '' : 'disabled'}></label><label>Timezone<input name="timezone" value="${esc(data.timezone || 'Asia/Kolkata')}" ${canWrite ? '' : 'disabled'}></label><label class="wide">Business description<textarea name="description" ${canWrite ? '' : 'disabled'}>${esc(data.description)}</textarea></label>${canWrite ? '<button type="submit">Save business profile</button>' : statusBadge('read only')}</form>`; if (canWrite) $('#business-form').onsubmit = async event => { event.preventDefault(); const button = event.currentTarget.querySelector('button'); setBusy(button, true, 'Saving...'); try { await api('/admin/business', {method: 'PATCH', body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget)))}); notice('Business profile saved.'); setBusy(button, false); } catch (error) { notice(error.message, true); setBusy(button, false); } }; return; }
     if (['services', 'faqs', 'knowledge'].includes(view)) { const fields = view === 'services' ? ['title', 'description'] : view === 'faqs' ? ['question', 'answer'] : ['title', 'content']; bindCrud(view, fields, root, await api('/admin/' + view)); return; }
@@ -89,8 +248,109 @@ async function show(view) {
 
 $('#login-form').onsubmit = login;
 document.querySelectorAll('.open-login').forEach(button => button.onclick = showLogin);
-$('#back-home').onclick = showLanding;
+$('#back-home').onclick = () => showCustomerAuth('login');
 document.querySelectorAll('[data-view]').forEach(button => button.onclick = () => show(button.dataset.view));
 $('#mobile-nav').onclick = () => $('#app').classList.toggle('nav-open');
-$('#sign-out').onclick = () => { localStorage.removeItem('agentToken'); token = ''; canWrite = false; showLanding(); };
-if (token) boot();
+$('#sign-out').onclick = () => { sessionStorage.removeItem('agentToken'); token = ''; canWrite = false; showLanding(); };
+const customerApi = async (path, options = {}) => {
+  const response = await fetch('/api/v1/customer' + path, {headers: {'Content-Type': 'application/json', ...(customerToken ? {Authorization: `Bearer ${customerToken}`} : {})}, ...options});
+  const data = response.status === 204 ? null : await response.json();
+  if (!response.ok) throw new Error(data.message || data.error || 'Request failed');
+  return data;
+};
+function showCustomerAuth(mode = 'login') {
+  document.body.classList.add('customer-auth-active');
+  $('#landing').hidden = true; $('#login').hidden = true; $('#app').hidden = true; $('#customer-app').hidden = true; $('#customer-auth').hidden = false;
+  document.querySelectorAll('.auth-mode').forEach(button => button.classList.toggle('active', button.dataset.customerMode === mode));
+  $('#customer-register-form').hidden = mode !== 'register'; $('#customer-login-form').hidden = mode !== 'login';
+  $('#customer-auth-title').textContent = mode === 'register' ? 'Create your secure account.' : 'Welcome back to Black Intel.';
+  $('#customer-auth-copy').textContent = mode === 'register' ? 'Your customer ID is issued once and remains yours.' : 'Use your name, Black Intel customer ID, and password.';
+  $('#customer-auth-error').textContent = '';
+}
+function customerMessage(text, role = 'assistant') {
+  const node = document.createElement('p'); node.className = `${role}-message`; node.textContent = text; $('#customer-messages').append(node); $('#customer-messages').scrollTop = $('#customer-messages').scrollHeight;
+}
+function renderCustomerHistory(data) {
+  const conversations = data.conversations || []; const appointments = data.appointments || [];
+  $('#customer-history-list').innerHTML = `${appointments.length ? appointments.map(item => `<article class="history-item"><span class="history-type">Appointment</span><strong>${esc(dateTime(item.start_at, item.timezone || customerTimeZone))}</strong><small>${esc(item.status)}</small>${item.status !== 'cancelled' ? `<span class="history-actions"><button class="history-control customer-reschedule" data-id="${item._id}" type="button">Reschedule</button><button class="history-control danger customer-cancel" data-id="${item._id}" type="button">Cancel</button></span>` : ''}</article>`).join('') : '<p class="history-empty">No appointments yet.</p>'}${conversations.length ? conversations.map(item => `<article class="history-item"><span class="history-type">Conversation</span><strong>${esc(dateTime(item.updated_at, customerTimeZone))}</strong><button class="history-control customer-conversation" data-id="${item._id}" type="button">Open conversation</button></article>`).join('') : '<p class="history-empty">No conversations yet.</p>'}`;
+  document.querySelectorAll('.customer-conversation').forEach(button => button.onclick = () => loadCustomerConversation(button.dataset.id));
+  document.querySelectorAll('.customer-cancel').forEach(button => button.onclick = async () => { try { await customerApi('/appointments/' + button.dataset.id + '/cancel', {method: 'POST'}); $('#customer-booking-message').textContent = 'Appointment cancelled.'; await loadCustomerDashboard(); } catch (error) { $('#customer-booking-message').textContent = error.message; } });
+  document.querySelectorAll('.customer-reschedule').forEach(button => button.onclick = () => { customerRescheduleAppointmentId = button.dataset.id; $('#customer-booking-message').textContent = 'Choose a new date and time, then confirm your reschedule.'; $('#customer-booking-form').elements.date.focus(); });
+}
+async function loadCustomerConversation(conversationId) {
+  try { const conversation = await customerApi('/conversations/' + conversationId); customerConversationId = conversation._id; $('#customer-messages').innerHTML = ''; conversation.messages.forEach(message => customerMessage(message.content, message.role === 'customer' ? 'customer' : 'assistant')); } catch (error) { $('#customer-booking-message').textContent = error.message; }
+}
+async function prepareCustomerBookingDate() {
+  const form = $('#customer-booking-form');
+  const input = form.elements.date;
+  const min = calendarDateInZone(new Date(), customerTimeZone);
+  input.min = min;
+  if (!input.value || input.value < min) input.value = min;
+  if (!form.elements.time.value) form.elements.time.value = '09:00';
+}
+async function checkCustomerRequestedTime() {
+  const form = $('#customer-booking-form');
+  const date = form.elements.date.value;
+  const time = form.elements.time.value;
+  const feedback = $('#customer-booking-message');
+  if (!date || !time) return false;
+  feedback.textContent = 'Checking your requested time...';
+  try {
+    let path = '/availability/check?date=' + encodeURIComponent(date) + '&time=' + encodeURIComponent(time);
+    if (customerRescheduleAppointmentId) {
+      path += '&appointment_id=' + encodeURIComponent(customerRescheduleAppointmentId);
+    }
+    const result = await customerApi(path);
+    if (result.timezone) customerTimeZone = result.timezone;
+    feedback.textContent = result.message;
+    return Boolean(result.available);
+  } catch (error) {
+    feedback.textContent = error.message;
+    return false;
+  }
+}
+async function loadCustomerDashboard() {
+  const data = await customerApi('/dashboard');
+  customerTimeZone = data.timezone || customerTimeZone;
+  $('#customer-name').textContent = `${data.customer.full_name} · ${data.customer.customer_id}`;
+  await prepareCustomerBookingDate();
+  renderCustomerHistory(data);
+}
+async function bootCustomer() {
+  try { await customerApi('/me'); document.body.classList.remove('customer-auth-active'); $('#landing').hidden = true; $('#login').hidden = true; $('#app').hidden = true; $('#customer-auth').hidden = true; $('#customer-app').hidden = false; await loadCustomerDashboard(); }
+  catch { sessionStorage.removeItem('customerToken'); customerToken = ''; showCustomerAuth('login'); }
+}
+async function customerAuthenticate(event, endpoint) {
+  event.preventDefault(); const form = event.currentTarget; const button = form.querySelector('button[type="submit"]'); setBusy(button, true, 'Please wait...'); $('#customer-auth-error').textContent = '';
+  try { const result = await customerApi(endpoint, {method: 'POST', body: JSON.stringify({...Object.fromEntries(new FormData(form)), widget_key: customerWidgetKey})}); customerToken = result.access_token; sessionStorage.customerToken = customerToken; await bootCustomer(); }
+  catch (error) { $('#customer-auth-error').textContent = error.message; }
+  finally { setBusy(button, false); }
+}
+document.querySelectorAll('.open-customer').forEach(button => button.onclick = () => showCustomerAuth(button.dataset.customerMode || 'login'));
+$('#open-admin-login').onclick = showLogin;
+document.querySelectorAll('.auth-mode').forEach(button => button.onclick = () => showCustomerAuth(button.dataset.customerMode));
+$('#customer-register-form').onsubmit = event => customerAuthenticate(event, '/auth/register');
+$('#customer-login-form').onsubmit = event => customerAuthenticate(event, '/auth/login');
+async function sendCustomerMessage(message) {
+  const normalized = message.trim();
+  if (!normalized) return;
+  customerMessage(normalized, 'customer');
+  try {
+    const endpoint = customerConversationId ? '/conversations/' + customerConversationId + '/messages' : '/chat';
+    const result = await customerApi(endpoint, {method: 'POST', body: JSON.stringify({message: normalized})});
+    customerConversationId = result.conversation_id;
+    customerMessage(result.answer);
+    await loadCustomerDashboard();
+  } catch (error) {
+    customerMessage(error.message, 'assistant');
+  }
+}
+$('#customer-chat-form').onsubmit = async event => { event.preventDefault(); const input = event.currentTarget.elements.message; const message = input.value; input.value = ''; await sendCustomerMessage(message); };
+document.querySelectorAll('[data-customer-prompt]').forEach(button => button.onclick = () => sendCustomerMessage(button.dataset.customerPrompt));
+$('#customer-own-question').onclick = () => $('#customer-chat-form').elements.message.focus();
+$('#customer-booking-form').elements.date.onchange = checkCustomerRequestedTime;
+$('#customer-booking-form').elements.time.onchange = checkCustomerRequestedTime;
+$('#customer-booking-form').onsubmit = async event => { event.preventDefault(); const form = event.currentTarget; const data = Object.fromEntries(new FormData(form)); const feedback = $('#customer-booking-message'); if (!data.date || !data.time) return; if (!await checkCustomerRequestedTime()) return; feedback.textContent = 'Confirming your requested time...'; try { const path = customerRescheduleAppointmentId ? '/appointments/' + customerRescheduleAppointmentId + '/reschedule' : '/appointments'; await customerApi(path, {method: 'POST', body: JSON.stringify(data)}); feedback.textContent = customerRescheduleAppointmentId ? 'Appointment rescheduled.' : 'Appointment confirmed.'; customerRescheduleAppointmentId = null; form.elements.time.value = ''; await loadCustomerDashboard(); } catch (error) { feedback.textContent = error.message; } };
+$('#customer-refresh').onclick = loadCustomerDashboard;
+$('#customer-sign-out').onclick = () => { sessionStorage.removeItem('customerToken'); customerToken = ''; showLanding(); };
+if (token) boot(); else if (customerToken) bootCustomer(); else showCustomerAuth('login');

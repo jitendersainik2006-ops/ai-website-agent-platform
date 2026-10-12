@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 import mongomock
 import pytest
@@ -9,6 +10,11 @@ from app.security.passwords import hash_password
 
 @pytest.fixture()
 def app_client():
+    # The MVP limiter is process-local. Clear it so one isolated Flask app does
+    # not inherit request counts from an earlier test app.
+    from app.api.public import _requests
+
+    _requests.clear()
     app = create_app(
         {"TESTING": True, "SECRET_KEY": "s" * 32, "JWT_SECRET_KEY": "j" * 32, "MONGODB_DATABASE": "mvp_tests"},
         mongomock.MongoClient(),
@@ -160,6 +166,24 @@ def test_service_pricing_hours_and_unknown_answer_quality(app_client):
     assert chat(client, key, "What is the weather today?").startswith("I do not have confirmed information")
 
 
+def test_widget_follow_up_uses_only_its_own_persisted_context(app_client):
+    client, _ = app_client
+    db = client.application.extensions["mongo_db"]
+    tenant = db.tenants.find_one({"slug": "tenant-one"})["_id"]
+    db.services.insert_one({"tenant_id": tenant, "title": "Incident Response", "description": "Confirmed response support for active security events.", "status": "published"})
+    key = {"X-Widget-Key": "tenant-one-key"}
+    first = client.post("/api/v1/chat", headers=key, json={"message": "Do you provide incident response?"})
+    assert first.status_code == 200
+    conversation_id = first.get_json()["conversation_id"]
+    follow_up = client.post(
+        f"/api/v1/public/conversations/{conversation_id}/messages",
+        headers=key,
+        json={"message": "What else should I know?"},
+    )
+    assert follow_up.status_code == 200
+    assert "confirmed response support" in follow_up.get_json()["answer"].lower()
+
+
 def test_relevant_faq_and_published_only_retrieval(app_client):
     client, _ = app_client
     db = client.application.extensions["mongo_db"]
@@ -170,6 +194,61 @@ def test_relevant_faq_and_published_only_retrieval(app_client):
     assert "confirmed response support" in chat(client, "tenant-one-key", "Do you support incident response?").lower()
     assert chat(client, "tenant-one-key", "What is the pricing?").startswith("I do not have confirmed information")
     assert chat(client, "tenant-one-key", "What is the weather?").startswith("I do not have confirmed information")
+
+
+def test_retrieval_preserves_approved_knowledge_source_url(app_client):
+    client, _ = app_client
+    db = client.application.extensions["mongo_db"]
+    tenant = db.tenants.find_one({"slug": "tenant-one"})["_id"]
+    db.knowledge.insert_one({
+        "tenant_id": tenant,
+        "title": "Black Intel official service information",
+        "content": "Black Intel's official information confirms digital forensics services.",
+        "source_url": "https://theblackintel.com/",
+        "status": "published",
+    })
+    with client.application.app_context():
+        from app.services.knowledge_service import retrieve
+
+        results = retrieve(str(tenant), "What official Black Intel information is available?")
+    assert results[0]["source_url"] == "https://theblackintel.com/"
+
+
+def test_official_knowledge_produces_distinct_grounded_company_answers(app_client):
+    client, _ = app_client
+    db = client.application.extensions["mongo_db"]
+    tenant = db.tenants.find_one({"slug": "tenant-one"})["_id"]
+    records = (
+        {
+            "title": "What does Black Intel do?",
+            "content": "Black Intel combines cybersecurity, artificial intelligence, digital forensics, and counter-intelligence.",
+        },
+        {
+            "title": "What services does Black Intel offer?",
+            "content": "Black Intel lists digital forensics, cyber offense, and defensive security as core divisions.",
+        },
+        {
+            "title": "How does Black Intel work with clients?",
+            "content": "Black Intel invites prospective clients to request a consultation to discuss their needs.",
+        },
+    )
+    for record in records:
+        db.knowledge.insert_one({
+            "tenant_id": tenant,
+            **record,
+            "source_url": "https://theblackintel.com/",
+            "status": "published",
+        })
+
+    answers = [
+        chat(client, "tenant-one-key", "What does Black Intel do?"),
+        chat(client, "tenant-one-key", "What services does Black Intel offer?"),
+        chat(client, "tenant-one-key", "How does Black Intel work with clients?"),
+    ]
+    assert "counter-intelligence" in answers[0].lower()
+    assert "core divisions" in answers[1].lower()
+    assert "consultation" in answers[2].lower()
+    assert len(set(answers)) == 3
 
 
 def test_hours_without_configured_hours_falls_back_safely(app_client):
@@ -197,6 +276,8 @@ def test_blocked_time_and_intent_classification(app_client):
     assert general["intent"] == "general"
     assert lead["intent"] == "lead"
     assert appointment["intent"] == "appointment"
+    assert "booking form" in appointment["answer"].lower()
+    assert "is confirmed" not in appointment["answer"].lower()
 
 
 def test_public_appointment_cancel_and_reschedule_are_token_bound(app_client):
@@ -317,3 +398,503 @@ def test_admin_appointment_management_uses_lifecycle_and_tenant_scope(app_client
     assert client.post(f"/api/v1/admin/appointments/{appointment_id}/reschedule", headers=owner, json={"start_at": slots[1]}).status_code == 409
     assert db.audit_logs.count_documents({"tenant_id": tenants[0][1], "action": "appointment.admin_rescheduled"}) == 2
     assert db.audit_logs.count_documents({"tenant_id": tenants[0][1], "action": "appointment.admin_cancelled"}) == 2
+
+
+def customer_auth(client, key, full_name="Asha Singh", password="CustomerPass123!"):
+    response = client.post(
+        "/api/v1/customer/auth/register",
+        json={"full_name": full_name, "age": 28, "reason": "Security consultation", "password": password, "widget_key": key},
+    )
+    assert response.status_code == 201, response.get_json()
+    result = response.get_json()
+    return {"Authorization": "Bearer " + result["access_token"]}, result
+
+
+def test_customer_registration_login_and_tenant_scoped_history(app_client):
+    client, _ = app_client
+    first_headers, first = customer_auth(client, "tenant-one-key")
+    assert first["customer"]["customer_id"] == "BI-000001"
+    assert "password_hash" not in first["customer"]
+    assert client.get("/api/v1/customer/me", headers=first_headers).status_code == 200
+    assert client.get("/api/v1/admin/context", headers=first_headers).status_code == 401
+
+    login = client.post(
+        "/api/v1/customer/auth/login",
+        json={"full_name": "Asha Singh", "customer_id": "BI-000001", "password": "CustomerPass123!", "widget_key": "tenant-one-key"},
+    )
+    assert login.status_code == 200
+    wrong_name = client.post(
+        "/api/v1/customer/auth/login",
+        json={"full_name": "Someone Else", "customer_id": "BI-000001", "password": "CustomerPass123!", "widget_key": "tenant-one-key"},
+    )
+    assert wrong_name.status_code == 401
+    assert wrong_name.get_json()["error"] == "invalid_credentials"
+    assert client.post("/api/v1/customer/auth/register", json={"full_name": "Invalid", "age": 28, "reason": "Test", "password": "CustomerPass123!", "widget_key": "wrong"}).status_code == 400
+
+    chat = client.post("/api/v1/customer/chat", headers=first_headers, json={"message": "Tell me about security consulting."})
+    assert chat.status_code == 200
+    conversation_id = chat.get_json()["conversation_id"]
+    continued_chat = client.post(
+        f"/api/v1/customer/conversations/{conversation_id}/messages",
+        headers=first_headers,
+        json={"message": "What else should I know?"},
+    )
+    assert continued_chat.status_code == 200
+    assert continued_chat.get_json()["conversation_id"] == conversation_id
+    booking = client.post("/api/v1/customer/appointments", headers=first_headers, json={"date": "2030-01-07", "time": "09:00"})
+    assert booking.status_code == 201
+    appointment_id = booking.get_json()["appointment"]["_id"]
+    assert "manage_token" not in booking.get_json()["appointment"]
+
+    second_headers, second = customer_auth(client, "tenant-one-key", "Vikram Rao")
+    assert second["customer"]["customer_id"] == "BI-000002"
+    assert client.post(f"/api/v1/customer/conversations/{conversation_id}/messages", headers=second_headers, json={"message": "Read this"}).status_code == 404
+    assert client.get(f"/api/v1/customer/conversations/{conversation_id}", headers=second_headers).status_code == 404
+    assert client.post(f"/api/v1/customer/appointments/{appointment_id}/cancel", headers=second_headers).status_code == 403
+    rescheduled = client.post(f"/api/v1/customer/appointments/{appointment_id}/reschedule", headers=first_headers, json={"date": "2030-01-07", "time": "09:30"})
+    assert rescheduled.status_code == 200
+    assert rescheduled.get_json()["appointment"]["status"] == "rescheduled"
+    transcript = client.get(f"/api/v1/customer/conversations/{conversation_id}", headers=first_headers)
+    assert transcript.status_code == 200
+    assert [message["role"] for message in transcript.get_json()["messages"]] == ["customer", "agent", "customer", "agent"]
+    dashboard = client.get("/api/v1/customer/dashboard", headers=first_headers).get_json()
+    assert len(dashboard["conversations"]) == 1
+    assert len(dashboard["appointments"]) == 1
+    assert client.post(f"/api/v1/customer/appointments/{appointment_id}/cancel", headers=first_headers).status_code == 200
+
+
+def test_customer_ids_restart_per_tenant_and_admin_can_manage_customers(app_client):
+    client, _ = app_client
+    first_headers, first = customer_auth(client, "tenant-one-key", "Tenant One Customer")
+    _, second = customer_auth(client, "tenant-two-key", "Tenant Two Customer")
+    assert first["customer"]["customer_id"] == second["customer"]["customer_id"] == "BI-000001"
+    owner = auth(client, "tenant-one")
+    customers = client.get("/api/v1/admin/customers", headers=owner).get_json()
+    assert [customer["full_name"] for customer in customers] == ["Tenant One Customer"]
+    customer_id = customers[0]["_id"]
+    assert client.patch(f"/api/v1/admin/customers/{customer_id}", headers=owner, json={"status": "inactive"}).status_code == 200
+    assert client.get("/api/v1/customer/dashboard", headers=first_headers).status_code == 401
+    disabled_login = client.post("/api/v1/customer/auth/login", json={"full_name": "Tenant One Customer", "customer_id": "BI-000001", "password": "CustomerPass123!", "widget_key": "tenant-one-key"})
+    assert disabled_login.status_code == 401
+
+
+def test_customer_id_allocation_is_atomic_under_parallel_registration(app_client):
+    client, _ = app_client
+    app = client.application
+
+    def register(index):
+        with app.app_context():
+            from app.services.customer_service import register_customer
+
+            result, error = register_customer({
+                "full_name": f"Parallel Customer {index}",
+                "age": 30,
+                "reason": "Parallel registration test",
+                "password": "CustomerPass123!",
+                "widget_key": "tenant-one-key",
+            })
+            assert error is None
+            return result["customer"]["customer_id"]
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        customer_ids = list(executor.map(register, range(4)))
+
+    assert sorted(customer_ids) == ["BI-000001", "BI-000002", "BI-000003", "BI-000004"]
+
+
+def test_customer_auth_rate_limit_does_not_reveal_credentials(app_client):
+    client, _ = app_client
+    from app.api.customer import _auth_requests
+
+    _auth_requests.clear()
+    payload = {"full_name": "Unknown Person", "customer_id": "BI-999999", "password": "CustomerPass123!", "widget_key": "tenant-one-key"}
+    for _ in range(10):
+        response = client.post("/api/v1/customer/auth/login", json=payload)
+        assert response.status_code == 401
+        assert response.get_json()["error"] == "invalid_credentials"
+    limited = client.post("/api/v1/customer/auth/login", json=payload)
+    assert limited.status_code == 429
+    assert limited.get_json()["error"] == "rate_limited"
+
+
+def test_availability_hides_past_dates_and_elapsed_slots(app_client, monkeypatch):
+    client, tenants = app_client
+    key = {"X-Widget-Key": "tenant-one-key"}
+    past = client.get("/api/v1/public/availability/slots?date=2020-01-06", headers=key)
+    assert past.status_code == 200
+    assert past.get_json()["slots"] == []
+    assert past.get_json()["timezone"] == "UTC"
+
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 7, 9, 15, tzinfo=timezone.utc))
+    today = client.get("/api/v1/public/availability/slots?date=2030-01-07", headers=key).get_json()
+    assert today["slots"]
+    assert all("09:00:00" not in slot for slot in today["slots"])
+    assert any("09:30:00" in slot for slot in today["slots"])
+    expired = client.post("/api/v1/public/appointments", headers=key, json={"start_at": "2030-01-07T09:00:00+00:00", "name": "Late", "email": "late@example.com"})
+    assert expired.status_code == 409
+    assert "no longer available" in expired.get_json()["message"].lower()
+
+
+def test_timezone_date_boundaries_accept_equivalent_instants(app_client, monkeypatch):
+    client, tenants = app_client
+    db = client.application.extensions["mongo_db"]
+    db.business_profiles.update_one({"tenant_id": tenants[0][1]}, {"$set": {"timezone": "Asia/Kolkata"}})
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 6, 12, tzinfo=timezone.utc))
+    key = {"X-Widget-Key": "tenant-one-key"}
+    slots = client.get("/api/v1/public/availability/slots?date=2030-01-07", headers=key).get_json()["slots"]
+    assert slots
+    assert slots[0].endswith("+05:30")
+    utc_equivalent = datetime.fromisoformat(slots[0]).astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    booked = client.post("/api/v1/public/appointments", headers=key, json={"start_at": utc_equivalent, "name": "Zone Visitor", "email": "zone@example.com"})
+    assert booked.status_code == 201, booked.get_json()
+    duplicate = client.post("/api/v1/public/appointments", headers=key, json={"start_at": slots[0], "name": "Zone Visitor", "email": "zone@example.com"})
+    assert duplicate.status_code == 409
+    outside = client.post("/api/v1/public/appointments", headers=key, json={"start_at": "2030-01-07T09:00:00+00:00", "name": "Wrong Zone", "email": "wrong-zone@example.com"})
+    assert outside.status_code == 409
+
+
+def test_customer_chat_guides_booking_without_inventing_slots(app_client):
+    client, _ = app_client
+    headers, _ = customer_auth(client, "tenant-one-key", "Booking Customer")
+    chat = client.post("/api/v1/customer/chat", headers=headers, json={"message": "Please book me an appointment tomorrow at 9am"})
+    assert chat.status_code == 200
+    payload = chat.get_json()
+    assert payload["intent"] == "appointment"
+    assert "booking form" in payload["answer"].lower()
+    assert "9am" not in payload["answer"].lower()
+    natural_request = client.post("/api/v1/customer/chat", headers=headers, json={"message": "Can we meet on 2030-01-07 at 09:00?"})
+    assert natural_request.status_code == 200
+    assert natural_request.get_json()["intent"] == "appointment"
+    assert "booking form" in natural_request.get_json()["answer"].lower()
+    assert client.get("/api/v1/customer/availability/slots?date=2019-12-30", headers=headers).get_json()["slots"] == []
+    available = client.get("/api/v1/customer/availability/check?date=2030-01-07&time=09:00", headers=headers)
+    assert available.status_code == 200
+    assert available.get_json()["available"] is True
+    booked = client.post("/api/v1/customer/appointments", headers=headers, json={"date": "2030-01-07", "time": "09:00"})
+    assert booked.status_code == 201
+    taken = client.post("/api/v1/customer/appointments", headers=headers, json={"date": "2030-01-07", "time": "09:00"})
+    assert taken.status_code == 409
+
+
+def test_customer_chat_uses_authenticated_name_only_for_greetings(app_client):
+    client, _ = app_client
+    first_headers, _ = customer_auth(client, "tenant-one-key", "Asha Singh")
+    second_headers, _ = customer_auth(client, "tenant-one-key", "Vikram Rao")
+
+    first = client.post("/api/v1/customer/chat", headers=first_headers, json={"message": "Hello"})
+    second = client.post("/api/v1/customer/chat", headers=second_headers, json={"message": "Hello"})
+
+    assert first.status_code == second.status_code == 200
+    assert "Asha Singh" in first.get_json()["answer"]
+    assert "Vikram Rao" not in first.get_json()["answer"]
+    assert "Vikram Rao" in second.get_json()["answer"]
+    typo = client.post("/api/v1/customer/chat", headers=first_headers, json={"message": "heelo"})
+    assert typo.status_code == 200
+    assert "Asha Singh" in typo.get_json()["answer"]
+    short_typo = client.post("/api/v1/customer/chat", headers=first_headers, json={"message": "hy"})
+    assert short_typo.status_code == 200
+    assert "Asha Singh" in short_typo.get_json()["answer"]
+
+
+def test_customer_books_currently_offered_slot_only(app_client, monkeypatch):
+    client, _ = app_client
+    headers, _ = customer_auth(client, "tenant-one-key", "Available Customer")
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 7, 9, 15, tzinfo=timezone.utc))
+
+    check = client.get("/api/v1/customer/availability/check?date=2030-01-07&time=09:30", headers=headers)
+    assert check.get_json()["available"] is True
+    assert client.post("/api/v1/customer/appointments", headers=headers, json={"date": "2030-01-07", "time": "09:30"}).status_code == 201
+    past = client.post("/api/v1/customer/appointments", headers=headers, json={"date": "2030-01-07", "time": "09:00"})
+    assert past.status_code == 409
+    assert "past" in past.get_json()["message"].lower()
+
+
+def test_customer_books_exact_timezone_slot_returned_by_availability(app_client, monkeypatch):
+    client, tenants = app_client
+    db = client.application.extensions["mongo_db"]
+    db.business_profiles.update_one({"tenant_id": tenants[0][1]}, {"$set": {"timezone": "Asia/Kolkata"}})
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 6, 12, tzinfo=timezone.utc))
+    headers, _ = customer_auth(client, "tenant-one-key", "Timezone Customer")
+
+    availability = client.get("/api/v1/customer/availability/check?date=2030-01-07&time=09:00", headers=headers)
+    assert availability.status_code == 200
+    assert availability.get_json()["available"] is True
+    booked = client.post("/api/v1/customer/appointments", headers=headers, json={"date": "2030-01-07", "time": "09:00"})
+    assert booked.status_code == 201, booked.get_json()
+    assert booked.get_json()["appointment"]["start_at"].endswith("+05:30")
+
+
+def test_customer_requested_time_enforces_hours_blocks_and_conflicts(app_client, monkeypatch):
+    client, tenants = app_client
+    headers, _ = customer_auth(client, "tenant-one-key", "Requested Time Customer")
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 6, 12, tzinfo=timezone.utc))
+    db = client.application.extensions["mongo_db"]
+    tenant = tenants[0][1]
+    db.blocked_times.insert_one({"tenant_id": tenant, "start_at": datetime(2030, 1, 7, 9, 30, tzinfo=timezone.utc), "end_at": datetime(2030, 1, 7, 10, 0, tzinfo=timezone.utc)})
+
+    outside = client.get("/api/v1/customer/availability/check?date=2030-01-07&time=08:45", headers=headers)
+    assert outside.get_json()["available"] is False
+    blocked = client.get("/api/v1/customer/availability/check?date=2030-01-07&time=09:30", headers=headers)
+    assert blocked.get_json()["available"] is False
+    first = client.post("/api/v1/customer/appointments", headers=headers, json={"date": "2030-01-07", "time": "09:00"})
+    assert first.status_code == 201
+    overlap = client.post("/api/v1/customer/appointments", headers=headers, json={"date": "2030-01-07", "time": "09:15"})
+    assert overlap.status_code == 409
+    assert "conflicts with an existing appointment" in overlap.get_json()["message"].lower()
+
+
+def test_concurrent_customer_requested_time_creates_only_one_appointment(app_client, monkeypatch):
+    client, tenants = app_client
+    app = client.application
+    tenant_id = str(tenants[0][1])
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 6, 12, tzinfo=timezone.utc))
+
+    def book_once():
+        with app.app_context():
+            from app.services.scheduling_service import create_appointment, customer_requested_start
+
+            start, error = customer_requested_start(tenant_id, "2030-01-07", "09:00")
+            assert error is None
+            appointment, error = create_appointment(
+                tenant_id,
+                {"start_at": start.isoformat(), "name": "Concurrent", "email": "concurrent@example.com"},
+                allow_customer_requested_time=True,
+            )
+            return appointment is not None, error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: book_once(), range(2)))
+
+    assert sum(created for created, _ in results) == 1
+    assert any(error and ("just booked" in error or "not available" in error) for _, error in results)
+
+
+def test_public_visitor_greetings_use_configured_business_name(app_client):
+    client, _ = app_client
+    first = client.post("/api/v1/chat", headers={"X-Widget-Key": "tenant-one-key"}, json={"message": "Hello"})
+    second = client.post("/api/v1/chat", headers={"X-Widget-Key": "tenant-two-key"}, json={"message": "Hi"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.get_json()["answer"] == "Hello. I can help with Tenant One's approved services, FAQs, or appointment booking."
+    assert second.get_json()["answer"] == "Hello. I can help with Tenant Two's approved services, FAQs, or appointment booking."
+
+    typo = client.post("/api/v1/chat", headers={"X-Widget-Key": "tenant-one-key"}, json={"message": "heelo"})
+    assert typo.status_code == 200
+    assert "Tenant One" in typo.get_json()["answer"]
+
+    hey = client.post("/api/v1/chat", headers={"X-Widget-Key": "tenant-one-key"}, json={"message": "hey there"})
+    assert hey.status_code == 200
+    assert "Tenant One" in hey.get_json()["answer"]
+
+
+def test_service_question_retrieves_published_official_knowledge(app_client):
+    client, tenants = app_client
+    db = client.application.extensions["mongo_db"]
+    tenant_id = tenants[0][1]
+
+    db.knowledge.insert_many([
+        {
+            "tenant_id": tenant_id,
+            "title": "What does Black Intel do?",
+            "content": "Black Intel combines cybersecurity, artificial intelligence, digital forensics, and counter-intelligence.",
+            "source_url": "https://theblackintel.com/",
+            "status": "published",
+        },
+        {
+            "tenant_id": tenant_id,
+            "title": "What services does Black Intel offer?",
+            "content": "Black Intel lists digital forensics, cyber offense, and defensive security as core divisions.",
+            "source_url": "https://theblackintel.com/",
+            "status": "published",
+        },
+        {
+            "tenant_id": tenant_id,
+            "title": "Refund policy",
+            "content": "All sales and retainers are final according to contract agreements.",
+            "source_url": "https://theblackintel.com/terms",
+            "status": "published",
+        },
+    ])
+
+    key = "tenant-one-key"
+    ans_provide = chat(client, key, "What services do you provide?")
+    assert "core divisions" in ans_provide.lower()
+    assert "digital forensics" in ans_provide.lower()
+
+    ans_offer = chat(client, key, "What services do you offer?")
+    assert "core divisions" in ans_offer.lower()
+
+    ans_services = chat(client, key, "What are your services?")
+    assert "core divisions" in ans_services.lower()
+
+    ans_do = chat(client, key, "What does Black Intel do?")
+    assert "counter-intelligence" in ans_do.lower()
+
+
+def test_customer_reschedule_excludes_own_appointment_and_enforces_auth(app_client, monkeypatch):
+    client, tenants = app_client
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 6, 12, tzinfo=timezone.utc))
+
+    headers_a, customer_a = customer_auth(client, "tenant-one-key", "Customer A")
+    headers_b, customer_b = customer_auth(client, "tenant-one-key", "Customer B")
+
+    booked_a = client.post("/api/v1/customer/appointments", headers=headers_a, json={"date": "2030-01-07", "time": "09:00"})
+    assert booked_a.status_code == 201
+    appt_a_id = booked_a.get_json()["appointment"]["_id"]
+
+    booked_b = client.post("/api/v1/customer/appointments", headers=headers_b, json={"date": "2030-01-07", "time": "09:30"})
+    assert booked_b.status_code == 201
+    appt_b_id = booked_b.get_json()["appointment"]["_id"]
+
+    check_own_conflict = client.get("/api/v1/customer/availability/check?date=2030-01-07&time=09:00", headers=headers_a)
+    assert check_own_conflict.get_json()["available"] is False
+    assert "conflicts with an existing appointment" in check_own_conflict.get_json()["message"].lower()
+
+    check_self_excluded = client.get(f"/api/v1/customer/availability/check?date=2030-01-07&time=09:00&appointment_id={appt_a_id}", headers=headers_a)
+    assert check_self_excluded.status_code == 200
+    assert check_self_excluded.get_json()["available"] is True
+    assert "available" in check_self_excluded.get_json()["message"].lower()
+
+    slots_response = client.get(f"/api/v1/customer/availability/slots?date=2030-01-07&appointment_id={appt_a_id}", headers=headers_a)
+    assert slots_response.status_code == 200
+    assert any("09:00" in slot for slot in slots_response.get_json()["slots"])
+
+    stolen_check = client.get(f"/api/v1/customer/availability/check?date=2030-01-07&time=09:00&appointment_id={appt_a_id}", headers=headers_b)
+    assert stolen_check.status_code == 403
+    assert stolen_check.get_json()["error"] == "appointment_not_authorized"
+
+    conflict_check = client.get(f"/api/v1/customer/availability/check?date=2030-01-07&time=09:30&appointment_id={appt_a_id}", headers=headers_a)
+    assert conflict_check.status_code == 200
+    assert conflict_check.get_json()["available"] is False
+    assert "conflicts with an existing appointment" in conflict_check.get_json()["message"].lower()
+
+    rescheduled_a = client.post(f"/api/v1/customer/appointments/{appt_a_id}/reschedule", headers=headers_a, json={"date": "2030-01-08", "time": "09:00"})
+    assert rescheduled_a.status_code == 200
+    assert rescheduled_a.get_json()["appointment"]["status"] == "rescheduled"
+
+
+def test_company_blocked_times_produce_specific_message(app_client, monkeypatch):
+    client, tenants = app_client
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 6, 12, tzinfo=timezone.utc))
+    db = client.application.extensions["mongo_db"]
+    tenant_id = tenants[0][1]
+
+    db.blocked_times.insert_one({
+        "tenant_id": tenant_id,
+        "start_at": datetime(2030, 1, 7, 9, 30, tzinfo=timezone.utc),
+        "end_at": datetime(2030, 1, 7, 10, 0, tzinfo=timezone.utc),
+    })
+
+    headers, _ = customer_auth(client, "tenant-one-key", "Blocked Customer")
+    response = client.get("/api/v1/customer/availability/check?date=2030-01-07&time=09:30", headers=headers)
+    assert response.status_code == 200
+    assert response.get_json()["available"] is False
+    assert "company-blocked period" in response.get_json()["message"]
+
+
+def test_public_widget_rescheduling_excludes_held_slot_with_token(app_client):
+    client, _ = app_client
+    key = {"X-Widget-Key": "tenant-one-key"}
+
+    slots = client.get("/api/v1/public/availability/slots?date=2030-01-07", headers=key).get_json()["slots"]
+    assert slots
+    first_slot = slots[0]
+    booked = client.post("/api/v1/public/appointments", headers=key, json={"start_at": first_slot, "name": "Visitor Held", "email": "held@example.com"})
+    assert booked.status_code == 201
+    appt = booked.get_json()["appointment"]
+    appt_id = appt["_id"]
+    token = appt["manage_token"]
+
+    subsequent_slots = client.get("/api/v1/public/availability/slots?date=2030-01-07", headers=key).get_json()["slots"]
+    assert first_slot not in subsequent_slots
+
+    reschedule_slots = client.get(f"/api/v1/public/availability/slots?date=2030-01-07&appointment_id={appt_id}&manage_token={token}", headers=key)
+    assert reschedule_slots.status_code == 200
+    assert first_slot in reschedule_slots.get_json()["slots"]
+
+    bad_token_slots = client.get(f"/api/v1/public/availability/slots?date=2030-01-07&appointment_id={appt_id}&manage_token=wrong_token_123456789012345", headers=key)
+    assert bad_token_slots.status_code == 403
+
+
+def test_admin_availability_slots_and_reschedule_validation(app_client):
+    client, tenants = app_client
+    key = {"X-Widget-Key": "tenant-one-key"}
+    owner = auth(client, "tenant-one")
+    other_owner = auth(client, "tenant-two")
+    db = client.application.extensions["mongo_db"]
+    tenant_id = tenants[0][1]
+
+    # 1. Admin slots endpoint requires auth
+    unauth = client.get("/api/v1/admin/availability/slots?date=2030-01-07")
+    assert unauth.status_code == 401
+
+    # Missing date param (400)
+    assert client.get("/api/v1/admin/availability/slots", headers=owner).status_code == 400
+    # Invalid date format (400)
+    assert client.get("/api/v1/admin/availability/slots?date=invalid-date", headers=owner).status_code == 400
+
+    # Get offered slots for 2030-01-07 (Monday: 09:00, 09:30)
+    slots_resp = client.get("/api/v1/admin/availability/slots?date=2030-01-07", headers=owner)
+    assert slots_resp.status_code == 200
+    slots = slots_resp.get_json()["slots"]
+    assert len(slots) == 2
+
+    # Book two appointments on Monday
+    booked1 = client.post("/api/v1/public/appointments", headers=key, json={"start_at": slots[0], "name": "Admin Test 1", "email": "t1@example.com"}).get_json()["appointment"]
+    booked2 = client.post("/api/v1/public/appointments", headers=key, json={"start_at": slots[1], "name": "Admin Test 2", "email": "t2@example.com"}).get_json()["appointment"]
+    appt1_id = booked1["_id"]
+    appt2_id = booked2["_id"]
+
+    # Slot 0 is taken, but excluding appt1 makes slot 0 available again
+    admin_slots_with_appt = client.get(f"/api/v1/admin/availability/slots?date=2030-01-07&appointment_id={appt1_id}", headers=owner)
+    assert admin_slots_with_appt.status_code == 200
+    assert slots[0] in admin_slots_with_appt.get_json()["slots"]
+    # But slot 1 (held by appt2) is excluded
+    assert slots[1] not in admin_slots_with_appt.get_json()["slots"]
+
+    # Tenant isolation on admin slots appointment_id lookup
+    assert client.get(f"/api/v1/admin/availability/slots?date=2030-01-07&appointment_id={appt1_id}", headers=other_owner).status_code == 404
+
+    # 2. Rescheduling validation reports specific reasons
+
+    # A) Invalid start_at format (400)
+    invalid_format = client.post(f"/api/v1/admin/appointments/{appt1_id}/reschedule", headers=owner, json={"start_at": "not-a-datetime"})
+    assert invalid_format.status_code == 400
+    assert "A valid appointment start time is required." in invalid_format.get_json()["message"]
+
+    # B) Closed business day (Sunday 2030-01-06)
+    closed_day = client.post(f"/api/v1/admin/appointments/{appt1_id}/reschedule", headers=owner, json={"start_at": "2030-01-06T09:00:00+00:00"})
+    assert closed_day.status_code == 409
+    assert "business is not available on that date" in closed_day.get_json()["message"]
+
+    # C) Outside business hours (04:00 AM)
+    outside_hours = client.post(f"/api/v1/admin/appointments/{appt1_id}/reschedule", headers=owner, json={"start_at": "2030-01-07T04:00:00+00:00"})
+    assert outside_hours.status_code == 409
+    assert "outside business hours" in outside_hours.get_json()["message"]
+
+    # D) Conflict with existing appointment (appt1 into appt2's slot 1)
+    conflict_res = client.post(f"/api/v1/admin/appointments/{appt1_id}/reschedule", headers=owner, json={"start_at": slots[1]})
+    assert conflict_res.status_code == 409
+    assert "conflicts with an existing appointment" in conflict_res.get_json()["message"]
+
+    # E) Company-blocked period on Tuesday 2030-01-08 at 09:30
+    db.blocked_times.insert_one({
+        "tenant_id": tenant_id,
+        "start_at": datetime(2030, 1, 8, 9, 30, tzinfo=timezone.utc),
+        "end_at": datetime(2030, 1, 8, 10, 0, tzinfo=timezone.utc),
+    })
+    blocked_res = client.post(f"/api/v1/admin/appointments/{appt1_id}/reschedule", headers=owner, json={"start_at": "2030-01-08T09:30:00+00:00"})
+    assert blocked_res.status_code == 409
+    assert "company-blocked period" in blocked_res.get_json()["message"]
+
+    # F) Invalid slot intervals on Wednesday (09:15 when slots are 09:00 and 09:30)
+    interval_res = client.post(f"/api/v1/admin/appointments/{appt1_id}/reschedule", headers=owner, json={"start_at": "2030-01-09T09:15:00+00:00"})
+    assert interval_res.status_code == 409
+    assert "does not align with the configured appointment slot intervals" in interval_res.get_json()["message"]
+
+    # G) Valid reschedule to Tuesday 09:00 offered slot
+    valid_res = client.post(f"/api/v1/admin/appointments/{appt1_id}/reschedule", headers=owner, json={"start_at": "2030-01-08T09:00:00+00:00"})
+    assert valid_res.status_code == 200
+    assert valid_res.get_json()["status"] == "rescheduled"
+    assert valid_res.get_json()["history"][-1]["action"] == "admin_rescheduled"

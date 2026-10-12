@@ -17,6 +17,9 @@ def create_app(config: dict | None = None, mongo_client=None) -> Flask:
         JWT_EXPIRY_MINUTES=int(os.environ.get("JWT_EXPIRY_MINUTES", "30")),
         MONGODB_URI=os.environ.get("MONGODB_URI", "mongodb://localhost:27017"),
         MONGODB_DATABASE=os.environ.get("MONGODB_DATABASE", "ai_agent_platform"),
+        MONGODB_SERVER_SELECTION_TIMEOUT_MS=int(
+            os.environ.get("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "5000")
+        ),
     )
     if config:
         app.config.update(config)
@@ -28,7 +31,10 @@ def create_app(config: dict | None = None, mongo_client=None) -> Flask:
             "Missing required environment variables: " + ", ".join(missing_settings)
         )
 
-    mongo_client = mongo_client or MongoClient(app.config["MONGODB_URI"])
+    mongo_client = mongo_client or MongoClient(
+        app.config["MONGODB_URI"],
+        serverSelectionTimeoutMS=app.config["MONGODB_SERVER_SELECTION_TIMEOUT_MS"],
+    )
     app.extensions["mongo_client"] = mongo_client
     app.extensions["mongo_db"] = mongo_client[app.config["MONGODB_DATABASE"]]
     from app.services.calendar_adapter import LocalCalendarAdapter
@@ -41,10 +47,12 @@ def create_app(config: dict | None = None, mongo_client=None) -> Flask:
     from app.api.auth import auth_bp
     from app.api.admin import admin_bp
     from app.api.public import public_bp
+    from app.api.customer import customer_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(admin_bp)
     app.register_blueprint(public_bp)
+    app.register_blueprint(customer_bp)
 
     @app.after_request
     def security_headers(response):
@@ -82,6 +90,10 @@ def _create_indexes(db) -> None:
     db.users.create_index("email", unique=True)
     db.memberships.create_index([("tenant_id", 1), ("user_id", 1)], unique=True)
     db.widget_configs.create_index("public_key", unique=True, sparse=True)
+    db.customers.create_index([("tenant_id", 1), ("customer_id", 1)], unique=True)
+    db.customers.create_index([("tenant_id", 1), ("full_name_normalized", 1)])
+    db.conversations.create_index([("tenant_id", 1), ("customer_id", 1), ("updated_at", -1)])
+    db.appointments.create_index([("tenant_id", 1), ("customer_id", 1), ("start_at", -1)])
     for collection in ("business_profiles", "services", "faqs", "knowledge", "business_hours", "blocked_times", "conversations", "messages", "leads", "appointments", "audit_logs"):
         db[collection].create_index("tenant_id")
     db.leads.create_index([("tenant_id", 1), ("email", 1)])

@@ -42,7 +42,7 @@ def login(email: str, password: str, tenant_slug: str) -> dict | None:
 
 def get_authenticated_identity(token: str) -> dict | None:
     payload = decode_access_token(token)
-    if not payload:
+    if not payload or payload.get("subject_type"):
         return None
 
     user_id = payload.get("sub")

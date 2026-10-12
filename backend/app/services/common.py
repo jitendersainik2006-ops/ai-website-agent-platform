@@ -26,10 +26,12 @@ def serialize(value):
 
 def audit(tenant_id, action: str, entity_type: str, entity_id=None, metadata=None) -> None:
     actor = getattr(g, "auth", None)
+    customer = getattr(g, "customer_auth", None)
     current_app.extensions["mongo_db"].audit_logs.insert_one(
         {
             "tenant_id": tenant_id,
-            "actor_id": actor["user"]["id"] if actor else None,
+            "actor_id": actor["user"]["id"] if actor else (customer["customer"]["id"] if customer else None),
+            "actor_type": "admin" if actor else ("customer" if customer else "system"),
             "action": action,
             "entity_type": entity_type,
             "entity_id": entity_id,
