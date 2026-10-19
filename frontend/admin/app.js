@@ -8,10 +8,8 @@ const customerWidgetKey = 'demo_black_intel_widget_key';
 let customerConversationId = null;
 let customerRescheduleAppointmentId = null;
 document.querySelectorAll('.brand').forEach(brand => { const mark = brand.querySelector('.brand-mark'); const label = brand.querySelector('span:last-child'); if (mark) mark.textContent = 'BI'; if (label) label.textContent = 'BLACK INTEL'; });
-const landingPrimary = document.querySelector('.hero-actions .button-primary');
-if (landingPrimary) { landingPrimary.classList.remove('open-login'); landingPrimary.classList.add('open-customer'); landingPrimary.dataset.customerMode = 'login'; landingPrimary.textContent = 'Customer login'; }
-const finalAction = document.querySelector('.final-cta .button-primary');
-if (finalAction) { finalAction.classList.remove('open-login'); finalAction.classList.add('open-customer'); finalAction.dataset.customerMode = 'register'; finalAction.textContent = 'Create your account'; }
+let publicConversationId = null;
+let publicTimeZone = 'Asia/Kolkata';
 const previewAgent = document.querySelector('.preview-message.agent b');
 if (previewAgent) previewAgent.textContent = 'Black Intel Agent';
 let canWrite = false;
@@ -69,7 +67,15 @@ function notice(text, isError = false) { const target = $('#notice'); target.tex
 function setBusy(button, busy, text) { if (!button) return; button.disabled = busy; button.dataset.label ||= button.textContent; button.textContent = busy ? text : button.dataset.label; }
 function setActive(view) { document.querySelectorAll('.nav-item').forEach(button => button.classList.toggle('active', button.dataset.view === view)); }
 function showLogin() { document.body.classList.add('customer-auth-active'); $('#landing').hidden = true; $('#login').hidden = false; $('#app').hidden = true; $('#customer-auth').hidden = true; $('#customer-app').hidden = true; }
-function showLanding() { showCustomerAuth('login'); }
+function showLanding() {
+  document.body.classList.remove('customer-auth-active');
+  $('#landing').hidden = false;
+  $('#login').hidden = true;
+  $('#app').hidden = true;
+  $('#customer-auth').hidden = true;
+  $('#customer-app').hidden = true;
+  if (typeof initPublicBookingDate === 'function') initPublicBookingDate();
+}
 
 async function login(event) {
   event.preventDefault();
@@ -281,7 +287,17 @@ async function show(view) {
 
 $('#login-form').onsubmit = login;
 document.querySelectorAll('.open-login').forEach(button => button.onclick = showLogin);
-$('#back-home').onclick = () => showCustomerAuth('login');
+const backHomeBtn = $('#back-home');
+if (backHomeBtn) backHomeBtn.onclick = showLanding;
+const customerBackBtn = $('#customer-back-home');
+if (customerBackBtn) customerBackBtn.onclick = showLanding;
+document.querySelectorAll('.brand').forEach(brand => {
+  brand.addEventListener('click', event => {
+    if ($('#app').hidden && $('#customer-app').hidden) {
+      showLanding();
+    }
+  });
+});
 document.querySelectorAll('[data-view]').forEach(button => button.onclick = () => show(button.dataset.view));
 $('#mobile-nav').onclick = () => $('#app').classList.toggle('nav-open');
 $('#sign-out').onclick = () => { sessionStorage.removeItem('agentToken'); token = ''; canWrite = false; showLanding(); };
@@ -643,4 +659,152 @@ $('#customer-booking-form').onsubmit = async event => {
 };
 $('#customer-refresh').onclick = loadCustomerDashboard;
 $('#customer-sign-out').onclick = () => { sessionStorage.removeItem('customerToken'); customerToken = ''; showLanding(); };
-if (token) boot(); else if (customerToken) bootCustomer(); else showCustomerAuth('login');
+
+async function sendPublicMessage(message) {
+  const normalized = (message || '').trim();
+  if (!normalized) return;
+  const messagesContainer = $('#public-chat-messages');
+  if (!messagesContainer) return;
+
+  const userNode = document.createElement('div');
+  userNode.className = 'preview-message user';
+  userNode.innerHTML = `<b>You</b><br>${esc(normalized)}`;
+  messagesContainer.appendChild(userNode);
+  messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+  const typingNode = document.createElement('div');
+  typingNode.className = 'preview-message agent typing-indicator';
+  typingNode.innerHTML = `<b>Black Intel Agent</b><br><small style="color:var(--muted)">Thinking...</small>`;
+  messagesContainer.appendChild(typingNode);
+  messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+  try {
+    const payload = {
+      message: normalized,
+      ...(publicConversationId ? { conversation_id: publicConversationId } : {})
+    };
+    const response = await fetch('/api/v1/public/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.message || result.error || 'Failed to process message.');
+    }
+    publicConversationId = result.conversation_id || publicConversationId;
+    typingNode.className = 'preview-message agent';
+    typingNode.innerHTML = `<b>Black Intel Agent</b><br>${renderMarkdown(result.answer)}`;
+  } catch (err) {
+    typingNode.className = 'preview-message agent';
+    typingNode.innerHTML = `<b>Black Intel Agent</b><br><span style="color:var(--danger)">${esc(err.message)}</span>`;
+  } finally {
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  }
+}
+
+const publicChatForm = $('#public-chat-form');
+if (publicChatForm) {
+  publicChatForm.onsubmit = async event => {
+    event.preventDefault();
+    const input = $('#public-chat-input');
+    const msg = input.value;
+    input.value = '';
+    await sendPublicMessage(msg);
+  };
+}
+document.querySelectorAll('[data-public-prompt]').forEach(button => {
+  button.onclick = () => sendPublicMessage(button.dataset.publicPrompt);
+});
+
+function initPublicBookingDate() {
+  const form = $('#public-booking-form');
+  if (!form) return;
+  const input = form.elements.date;
+  if (!input) return;
+  const min = calendarDateInZone(new Date(), publicTimeZone);
+  input.min = min;
+  if (!input.value || input.value < min) {
+    input.value = nextOpenCalendarDate(publicTimeZone);
+  }
+  if (!form.elements.time.value) {
+    form.elements.time.value = '10:00';
+  }
+  checkPublicRequestedTime();
+}
+
+async function checkPublicRequestedTime() {
+  const form = $('#public-booking-form');
+  if (!form) return false;
+  const date = form.elements.date.value;
+  const time = form.elements.time.value;
+  const feedback = $('#public-booking-feedback');
+  if (!feedback) return false;
+  if (!date || !time) {
+    feedback.textContent = '';
+    return false;
+  }
+  feedback.textContent = 'Checking availability...';
+  feedback.style.color = 'var(--muted)';
+  try {
+    const res = await fetch(`/api/v1/public/availability/check?date=${encodeURIComponent(date)}&time=${encodeURIComponent(time)}`);
+    const data = await res.json();
+    if (data.timezone) publicTimeZone = data.timezone;
+    feedback.textContent = data.message;
+    feedback.style.color = data.available ? 'var(--accent)' : 'var(--danger)';
+    return Boolean(data.available);
+  } catch (err) {
+    feedback.textContent = err.message || 'Unable to check availability.';
+    feedback.style.color = 'var(--danger)';
+    return false;
+  }
+}
+
+const publicBookingForm = $('#public-booking-form');
+if (publicBookingForm) {
+  publicBookingForm.elements.date.onchange = checkPublicRequestedTime;
+  publicBookingForm.elements.date.oninput = checkPublicRequestedTime;
+  publicBookingForm.elements.time.onchange = checkPublicRequestedTime;
+  publicBookingForm.elements.time.oninput = checkPublicRequestedTime;
+  publicBookingForm.onsubmit = async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const submitBtn = form.querySelector('button[type="submit"]');
+    const feedback = $('#public-booking-feedback');
+    const formData = new FormData(form);
+    const data = Object.fromEntries(formData);
+    if (!data.name || !data.email || !data.date || !data.time) {
+      feedback.textContent = 'Please fill in required fields (Name, Email, Date, Time).';
+      feedback.style.color = 'var(--danger)';
+      return;
+    }
+    setBusy(submitBtn, true, 'Confirming consultation...');
+    try {
+      const isAvailable = await checkPublicRequestedTime();
+      if (!isAvailable) {
+        setBusy(submitBtn, false);
+        return;
+      }
+      const res = await fetch('/api/v1/public/appointments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        throw new Error(result.message || result.error || 'Failed to book consultation');
+      }
+      feedback.style.color = 'var(--accent)';
+      feedback.innerHTML = `<strong>Consultation Confirmed!</strong><br>Scheduled for ${dateTime(result.appointment.start_at, result.appointment.timezone)}. Reference: <code>${result.appointment.manage_token ? result.appointment.manage_token.slice(0, 8) + '...' : 'Confirmed'}</code>.`;
+      form.reset();
+      initPublicBookingDate();
+    } catch (err) {
+      feedback.style.color = 'var(--danger)';
+      feedback.textContent = err.message;
+    } finally {
+      setBusy(submitBtn, false);
+    }
+  };
+}
+
+if (token) boot(); else if (customerToken) bootCustomer(); else showLanding();

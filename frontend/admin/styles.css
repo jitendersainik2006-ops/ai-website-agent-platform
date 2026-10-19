@@ -44,3 +44,31 @@
 .history-type{color:var(--accent)}
 .history-control{background:#211b0b;border:1px solid #5e4c1a;color:#f5f2e8}
 .history-control:hover{background:#382d0f;border-color:var(--accent)}
+.public-chat-console{position:relative;top:auto;right:auto;width:100%;max-width:480px;margin:0 auto;background:#0d0d0df2;border:1px solid #4f4323;border-radius:12px;box-shadow:0 16px 48px rgba(0,0,0,.65);overflow:hidden;z-index:2}
+.public-chat-thread{height:280px;overflow-y:auto;display:flex;flex-direction:column;gap:12px;padding:18px;background-image:url('/frontend/admin/black-intel-watermark.png');background-repeat:no-repeat;background-position:center center;background-size:min(180px,55%);background-color:#080808;border-bottom:1px solid #353024}
+.public-chat-suggestions{display:flex;flex-wrap:wrap;gap:6px;padding:10px 14px;background:#0d0d0d;border-bottom:1px solid #242015}
+.public-chat-suggestions .chip{background:#171308;border:1px solid #5e4c1a;border-radius:16px;color:#eadcae;font-size:11px;padding:5px 10px;cursor:pointer;transition:all .16s ease}
+.public-chat-suggestions .chip:hover{background:#2b230e;border-color:var(--accent);color:#fff;transform:translateY(-1px)}
+.public-chat-composer{display:grid;grid-template-columns:1fr auto;gap:8px;padding:12px 14px;background:#0d0d0d}
+.public-chat-composer input{background:#080808;border:1px solid #494126;border-radius:6px;color:var(--text);padding:9px 12px;font-size:13px;width:100%}
+.public-chat-composer input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(214,175,66,.32)}
+.public-chat-composer .button-primary{min-height:38px;padding:0 16px}
+.preview-message.user{align-self:flex-end;background:#25200e;border:1px solid #665321;border-radius:7px;font-size:13px;line-height:1.55;padding:10px 12px;max-width:86%;word-break:break-word}
+.preview-message.user b{color:#e5dec9;font-size:11px}
+.preview-message.agent{align-self:flex-start;background:#15120a;border:1px solid #3d341c;border-radius:7px;font-size:13px;line-height:1.55;padding:10px 12px;max-width:88%;word-break:break-word}
+.preview-message.agent b{color:var(--accent);font-size:11px}
+.preview-message pre{background:#050505;border:1px solid #353024;border-radius:6px;padding:8px 10px;margin:8px 0;overflow-x:auto;font-family:monospace;font-size:12px;white-space:pre}
+.preview-message code{background:rgba(255,255,255,.08);padding:2px 4px;border-radius:3px;font-family:monospace;font-size:12px}
+.preview-message pre code{background:transparent;padding:0}
+.preview-message ul,.preview-message ol{margin:6px 0 6px 18px;padding:0}
+.preview-message li{margin-bottom:4px}
+.preview-message .md-heading{color:var(--accent);font-size:14px;font-weight:700;margin:10px 0 4px}
+.consultation-section{border-top:1px solid var(--line-soft);padding:80px 28px}
+.public-booking-container{margin-top:32px;background:#0d0d0dfa;border:1px solid #5e4c1a;border-radius:10px;padding:28px;max-width:760px;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+.public-booking-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
+.public-booking-form label{color:#ddd4c0;display:grid;font-size:12px;font-weight:700;gap:6px}
+.public-booking-form input{background:#080808;border:1px solid #494126;border-radius:6px;color:var(--text);min-height:42px;padding:9px 12px;font-size:13px;color-scheme:dark;width:100%}
+.public-booking-form input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(214,175,66,.32)}
+.public-booking-form .button-primary{width:100%;min-height:46px;margin-top:18px;font-size:14px}
+.live-pill{background:#172b16;border:1px solid #2a6227;color:#7de877;border-radius:12px;padding:2px 8px;font-size:10px;font-weight:700;letter-spacing:.05em}
+@media(max-width:760px){.public-booking-grid{grid-template-columns:1fr}.public-chat-console{max-width:100%}.hero-visual .signal-card{display:none}}

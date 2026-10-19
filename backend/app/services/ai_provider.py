@@ -65,7 +65,10 @@ def call_gemini(
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": api_key,
+        },
         method="POST",
     )
 
@@ -83,6 +86,10 @@ def call_gemini(
             return str(parts[0]["text"]).strip()
     except urllib.error.HTTPError as exc:
         sanitized_url = _sanitize_text(url)
+        # If a non-standard model name returned 404, retry once with standard gemini-2.0-flash
+        if exc.code == 404 and model_name != "gemini-2.0-flash":
+            logger.info("Gemini model '%s' not found (404). Retrying with gemini-2.0-flash.", model_name)
+            return call_gemini(api_key, "gemini-2.0-flash", system_prompt, messages, timeout=timeout)
         raise RuntimeError(f"Gemini HTTP {exc.code} calling {sanitized_url}") from exc
     except Exception as exc:
         raise RuntimeError(f"Gemini call failed: {_sanitize_text(str(exc))}") from exc
@@ -188,14 +195,12 @@ def generate_ai_completion(
     elif provider == "openai_compatible" and openai_key:
         active_provider = "openai_compatible"
     elif provider in {"auto", "local", ""}:
-        # Auto-detect if a key is present and not explicitly set to local
-        if provider != "local":
-            if gemini_key:
-                active_provider = "gemini"
-            elif groq_key:
-                active_provider = "groq"
-            elif openai_key:
-                active_provider = "openai_compatible"
+        if gemini_key:
+            active_provider = "gemini"
+        elif groq_key:
+            active_provider = "groq"
+        elif openai_key:
+            active_provider = "openai_compatible"
 
     if not active_provider:
         return None, None, "Local mode (no external provider configured)"

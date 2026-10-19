@@ -236,6 +236,17 @@ def _local_fallback_response(tenant_id: str, context: list[dict], profile: dict,
     return {"answer": fallback, "citations": [], "intent": intent, "provider": "local"}
 
 
+def _is_general_technical_query(message: str) -> bool:
+    lowered = message.lower()
+    technical_markers = (
+        "python", "javascript", "java", "c++", "html", "css", "sql", "database",
+        "write code", "program to", "programming", "algorithm", "function", "loop",
+        "rest api", "endpoint", "debug", "exception", "syntax",
+        "photosynthesis"
+    )
+    return any(marker in lowered for marker in technical_markers) or "api" in lowered.split()
+
+
 def respond(
     tenant_id: str,
     message: str,
@@ -287,9 +298,25 @@ def respond(
         }
 
     provider_config = str(current_app.config.get("LLM_PROVIDER") or "local").lower().strip()
+    has_key = bool(
+        current_app.config.get("GEMINI_API_KEY")
+        or current_app.config.get("GROQ_API_KEY")
+        or current_app.config.get("OPENAI_COMPATIBLE_API_KEY")
+    )
 
-    # When in local mode, strictly use the local deterministic engine
-    if provider_config in {"local", "none", ""}:
+    # When explicitly disabled with "none", or in local mode without any API key, use local deterministic engine
+    if provider_config in {"none"} or (provider_config == "local" and not has_key):
+        if _is_general_technical_query(message) and not context:
+            return {
+                "answer": (
+                    "External AI completion is currently unavailable. "
+                    f"I can answer confirmed questions about {business_name}'s cybersecurity services, FAQs, and consultation scheduling. "
+                    "For general programming assistance or external AI completions, please configure a supported AI provider (such as Google Gemini or Groq)."
+                ),
+                "citations": [],
+                "intent": intent,
+                "provider": "local",
+            }
         return _local_fallback_response(tenant_id, context, profile, intent)
 
     # Optional web search augmentation (disabled by default)
@@ -325,4 +352,15 @@ def respond(
 
     # Safe fallback if AI provider call fails or rate-limits: use local deterministic engine
     logger.info("AI completion unavailable (%s). Falling back to local response.", err)
+    if _is_general_technical_query(message) and not context:
+        return {
+            "answer": (
+                "External AI completion is currently unavailable. "
+                f"I can answer confirmed questions about {business_name}'s cybersecurity services, FAQs, and consultation scheduling. "
+                "For general programming assistance or external AI completions, please ensure a valid AI provider API key is configured or try again shortly."
+            ),
+            "citations": [],
+            "intent": intent,
+            "provider": "local",
+        }
     return _local_fallback_response(tenant_id, context, profile, intent)

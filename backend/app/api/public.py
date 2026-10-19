@@ -7,7 +7,16 @@ from flask import Blueprint, current_app, g, jsonify, request
 
 from app.services.common import now, object_id, serialize
 from app.services.llm_gateway import respond
-from app.services.scheduling_service import available_slots, cancel_appointment, create_appointment, get_managed_appointment, reschedule_appointment, tenant_timezone_name
+from app.services.scheduling_service import (
+    available_slots,
+    cancel_appointment,
+    create_appointment,
+    customer_requested_start,
+    customer_requested_time_status,
+    get_managed_appointment,
+    reschedule_appointment,
+    tenant_timezone_name,
+)
 
 public_bp = Blueprint("public", __name__, url_prefix="/api/v1")
 _requests = defaultdict(deque)
@@ -34,9 +43,27 @@ def require_widget(view):
         key = request.headers.get("X-Widget-Key") or request.args.get("widget_key")
         if not key and request.is_json:
             key = (request.get_json(silent=True) or {}).get("widget_key")
-        config = current_app.extensions["mongo_db"].widget_configs.find_one({"public_key": key, "enabled": {"$ne": False}})
-        if not config:
-            return jsonify({"error": "invalid_widget", "message": "Widget access is not available."}), 401
+        db = current_app.extensions["mongo_db"]
+        config = None
+        if key:
+            config = db.widget_configs.find_one({"public_key": key, "enabled": {"$ne": False}})
+            if not config:
+                return jsonify({"error": "invalid_widget", "message": "Widget access is not available."}), 401
+        else:
+            # Safely resolve server-configured Black Intel primary tenant for first-party public site
+            bi_tenant = db.tenants.find_one({"slug": "black-intel-demo"}) or db.tenants.find_one(
+                {"name": {"$regex": "Black Intel", "$options": "i"}}
+            )
+            if bi_tenant:
+                config = db.widget_configs.find_one({"tenant_id": bi_tenant["_id"], "enabled": {"$ne": False}}) or {
+                    "tenant_id": bi_tenant["_id"],
+                    "public_key": "demo_black_intel_widget_key",
+                    "enabled": True,
+                    "allowed_origins": [],
+                }
+            if not config:
+                return jsonify({"error": "invalid_widget", "message": "Widget access is not available."}), 401
+
         origin = request.headers.get("Origin")
         allowed = config.get("allowed_origins", [])
         if origin and allowed and origin not in allowed:
@@ -73,6 +100,7 @@ def create_conversation():
 
 
 @public_bp.post("/public/conversations/<conversation_id>/messages")
+@public_bp.post("/public/chat")
 @public_bp.post("/chat")
 @require_widget
 @_rate_limit
@@ -140,11 +168,37 @@ def slots():
         return jsonify({"error": "validation_error", "message": "date must be YYYY-MM-DD."}), 400
 
 
+@public_bp.get("/public/availability/check")
+@require_widget
+def check_availability():
+    date_text = request.args.get("date")
+    time_text = request.args.get("time")
+    tenant_id = _tenant_id()
+    start, error = customer_requested_time_status(tenant_id, date_text, time_text)
+    if error:
+        return jsonify({"available": False, "message": error, "timezone": tenant_timezone_name(tenant_id)})
+    return jsonify({
+        "available": True,
+        "message": f"Slot is available ({start.strftime('%A, %d %B %Y at %H:%M')} {tenant_timezone_name(tenant_id)}).",
+        "timezone": tenant_timezone_name(tenant_id),
+        "start_at": start.isoformat(),
+    })
+
+
 @public_bp.post("/public/appointments")
 @require_widget
 @_rate_limit
 def book():
-    appointment, error = create_appointment(_tenant_id(), _json())
+    payload = _json()
+    tenant_id = _tenant_id()
+    allow_custom = False
+    if "date" in payload and "time" in payload and "start_at" not in payload:
+        start, error = customer_requested_start(tenant_id, payload.get("date"), payload.get("time"))
+        if error:
+            return jsonify({"error": "validation_error", "message": error}), 400
+        payload["start_at"] = start.isoformat()
+        allow_custom = True
+    appointment, error = create_appointment(tenant_id, payload, allow_customer_requested_time=allow_custom)
     if error:
         return jsonify({"error": "booking_unavailable", "message": error}), 409
     return jsonify({"appointment": appointment}), 201

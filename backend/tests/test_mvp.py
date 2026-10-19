@@ -1892,3 +1892,211 @@ def test_customer_booking_panel_contains_appointment_helper_text(app_client):
     html = response.get_data(as_text=True)
     expected_note = "Hours: Monday–Friday, 09:00–17:00 IST · Consultation: 30 minutes · Buffer: 15 minutes"
     assert expected_note in html, "Customer booking panel must display the appointment helper text"
+
+
+def test_public_chat_without_widget_key_resolves_primary_black_intel(app_client):
+    """
+    Public website visitors must be able to chat anonymously from the homepage
+    without providing a widget key or logging in. The backend securely resolves
+    the primary Black Intel Demo tenant.
+    """
+    client, tenants = app_client
+    db = client.application.extensions["mongo_db"]
+    bi_tenant = db.tenants.find_one({"slug": "black-intel-demo"})
+    if not bi_tenant:
+        bi_tenant_id = db.tenants.insert_one({"name": "Black Intel Demo", "slug": "black-intel-demo"}).inserted_id
+        db.business_profiles.insert_one({
+            "tenant_id": bi_tenant_id,
+            "name": "Black Intel",
+            "contact_email": "abhishek.managerr@gmail.com",
+            "timezone": "Asia/Kolkata",
+            "appointment_duration_minutes": 30,
+            "appointment_buffer_minutes": 15,
+        })
+        db.widget_configs.insert_one({
+            "tenant_id": bi_tenant_id,
+            "public_key": "demo_black_intel_widget_key",
+            "enabled": True,
+            "allowed_origins": [],
+        })
+    else:
+        bi_tenant_id = bi_tenant["_id"]
+
+    response = client.post("/api/v1/public/chat", json={"message": "What services does Black Intel offer?"})
+    assert response.status_code == 200
+    data = response.get_json()
+    assert "conversation_id" in data
+    assert "answer" in data
+    assert len(data["answer"]) > 10
+
+    conv = db.conversations.find_one({"_id": ObjectId(data["conversation_id"])})
+    assert conv is not None
+    assert conv["tenant_id"] == bi_tenant_id
+
+    res_alias = client.post("/api/v1/chat", json={"message": "What does Black Intel do?"})
+    assert res_alias.status_code == 200
+    assert "answer" in res_alias.get_json()
+
+
+def test_public_chat_general_technical_query_gives_honest_diagnostic_fallback(app_client):
+    """
+    When an external AI provider (Gemini/Groq) is offline or unconfigured, general
+    coding questions (e.g. 'Write a Python program to add two numbers') should receive
+    an honest, transparent diagnostic message explaining that external generative AI
+    is offline, rather than inappropriate company fallback text or 'contact Abhishek'.
+    """
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    db = client.application.extensions["mongo_db"]
+
+    bi_tenant = db.tenants.find_one({"slug": "black-intel-demo"})
+    if not bi_tenant:
+        bi_tenant_id = db.tenants.insert_one({"name": "Black Intel Demo", "slug": "black-intel-demo"}).inserted_id
+        db.business_profiles.insert_one({
+            "tenant_id": bi_tenant_id,
+            "name": "Black Intel",
+            "contact_email": "abhishek.managerr@gmail.com",
+            "timezone": "Asia/Kolkata",
+        })
+    else:
+        bi_tenant_id = bi_tenant["_id"]
+
+    with client.application.app_context():
+        res = respond(str(bi_tenant_id), "Write a Python program to add two numbers.")
+        answer = res["answer"]
+        assert "generative AI provider" in answer or "offline" in answer or "configured" in answer
+        assert "abhishek.managerr@gmail.com" not in answer, "Must not tell visitors to email Abhishek for Python code"
+
+
+def test_public_chat_general_query_with_mocked_ai_completion(app_client, monkeypatch):
+    """
+    When the AI provider is configured and available, general coding or technical queries
+    return the full AI-generated completion.
+    """
+    import app.services.llm_gateway as llm_gw
+
+    client, tenants = app_client
+    db = client.application.extensions["mongo_db"]
+
+    bi_tenant = db.tenants.find_one({"slug": "black-intel-demo"})
+    if not bi_tenant:
+        bi_tenant_id = db.tenants.insert_one({"name": "Black Intel Demo", "slug": "black-intel-demo"}).inserted_id
+        db.business_profiles.insert_one({
+            "tenant_id": bi_tenant_id,
+            "name": "Black Intel",
+            "timezone": "Asia/Kolkata",
+        })
+    else:
+        bi_tenant_id = bi_tenant["_id"]
+
+    client.application.config["GEMINI_API_KEY"] = "AIzaSyTestMockKey"
+    mock_code = "```python\ndef add(a, b):\n    return a + b\n```"
+    monkeypatch.setattr(llm_gw, "generate_ai_completion", lambda *args, **kwargs: (mock_code, "gemini", None))
+
+    with client.application.app_context():
+        res = llm_gw.respond(str(bi_tenant_id), "Write a Python program to add two numbers.")
+        assert "def add(a, b):" in res["answer"]
+        assert res["provider"] == "gemini"
+
+
+def test_public_availability_check_and_appointment_booking(app_client):
+    """
+    Public visitors can check availability and book consultations without logging in.
+    The appointment uses 30-min duration, 15-min buffer, creates a lead record, and
+    rejects collision attempts.
+    """
+    client, tenants = app_client
+    db = client.application.extensions["mongo_db"]
+
+    bi_tenant = db.tenants.find_one({"slug": "black-intel-demo"})
+    if not bi_tenant:
+        bi_tenant_id = db.tenants.insert_one({"name": "Black Intel Demo", "slug": "black-intel-demo"}).inserted_id
+        db.business_profiles.insert_one({
+            "tenant_id": bi_tenant_id,
+            "name": "Black Intel",
+            "contact_email": "abhishek.managerr@gmail.com",
+            "timezone": "Asia/Kolkata",
+            "appointment_duration_minutes": 30,
+            "appointment_buffer_minutes": 15,
+        })
+        db.widget_configs.insert_one({
+            "tenant_id": bi_tenant_id,
+            "public_key": "demo_black_intel_widget_key",
+            "enabled": True,
+            "allowed_origins": [],
+        })
+        for weekday in range(5):
+            db.business_hours.insert_one({
+                "tenant_id": bi_tenant_id,
+                "weekday": weekday,
+                "enabled": True,
+                "start_time": "09:00",
+                "end_time": "17:00",
+            })
+    else:
+        bi_tenant_id = bi_tenant["_id"]
+        if db.business_hours.count_documents({"tenant_id": bi_tenant_id}) == 0:
+            for weekday in range(5):
+                db.business_hours.insert_one({
+                    "tenant_id": bi_tenant_id,
+                    "weekday": weekday,
+                    "enabled": True,
+                    "start_time": "09:00",
+                    "end_time": "17:00",
+                })
+
+    future_date = datetime.now(timezone.utc) + timedelta(days=14)
+    while future_date.weekday() >= 5:
+        future_date += timedelta(days=1)
+    date_str = future_date.strftime("%Y-%m-%d")
+
+    res_avail = client.get(f"/api/v1/public/availability/check?date={date_str}&time=10:00")
+    assert res_avail.status_code == 200
+    avail_data = res_avail.get_json()
+    assert avail_data["available"] is True
+    assert "Asia/Kolkata" in avail_data["timezone"]
+
+    booking_payload = {
+        "date": date_str,
+        "time": "10:00",
+        "name": "Jane Public",
+        "email": "jane.public@example.com",
+        "phone": "+91 9876543210",
+        "requirement": "Security assessment for cloud platform",
+    }
+    res_book = client.post("/api/v1/public/appointments", json=booking_payload)
+    assert res_book.status_code == 201
+    booking_data = res_book.get_json()
+    assert "appointment" in booking_data
+    appt = booking_data["appointment"]
+    assert appt["status"] == "confirmed"
+    assert "manage_token" in appt
+
+    lead = db.leads.find_one({"tenant_id": bi_tenant_id, "email": "jane.public@example.com"})
+    assert lead is not None
+    assert lead["name"] == "Jane Public"
+
+    res_dup = client.post("/api/v1/public/appointments", json=booking_payload)
+    assert res_dup.status_code == 409
+
+    res_buffer = client.post("/api/v1/public/appointments", json={**booking_payload, "time": "10:35"})
+    assert res_buffer.status_code == 409
+
+
+def test_public_website_landing_page_renders_chat_and_booking(app_client):
+    """
+    The public homepage at GET / must render the landing page without hidden attribute,
+    displaying the live chat console, consultation booking section, and Black & Gold assets.
+    """
+    client, _ = app_client
+    response = client.get("/")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+
+    assert '<main id="landing" class="landing">' in html
+    assert 'id="public-chat-messages"' in html
+    assert 'id="public-chat-form"' in html
+    assert 'id="public-booking-form"' in html
+    assert 'id="consultation"' in html
+    assert 'Black Intel AI Assistant' in html
