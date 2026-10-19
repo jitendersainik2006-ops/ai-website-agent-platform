@@ -63,8 +63,8 @@ def seed() -> None:
                 "$set": {
                     "name": "Black Intel Demo",
                     "description": "Black Intel Demo provides practical cybersecurity assessments, incident response guidance, and security consulting.",
-                    "contact_email": "admin@blackintel.com",
-                    "contact_phone": "+91 00000 00000",
+                    "contact_email": "abhishek.managerr@gmail.com",
+                    "contact_phone": "+91 9205105369",
                     "timezone": "Asia/Kolkata",
                     "appointment_duration_minutes": 30,
                     "appointment_buffer_minutes": 15,

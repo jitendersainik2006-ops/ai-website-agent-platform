@@ -1189,10 +1189,11 @@ def test_customer_portal_appointment_booking_guidance_references_form(app_client
     assert "cannot" in data["answer"].lower()
 
 
-def test_appointment_cancelled_slot_can_be_rebooked_immediately(app_client):
+def test_appointment_cancelled_slot_can_be_rebooked_immediately(app_client, monkeypatch):
     client, _ = app_client
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 6, 12, tzinfo=timezone.utc))
     headers, _ = customer_auth(client, "tenant-one-key", full_name="Rohan Verma")
-    slot_res = client.get("/api/v1/customer/availability/slots?date=2026-10-19", headers=headers)
+    slot_res = client.get("/api/v1/customer/availability/slots?date=2030-01-07", headers=headers)
     assert slot_res.status_code == 200
     slots = slot_res.get_json()["slots"]
     assert slots, "Expected offered slots on Monday"
@@ -1202,7 +1203,7 @@ def test_appointment_cancelled_slot_can_be_rebooked_immediately(app_client):
     book1 = client.post(
         "/api/v1/customer/appointments",
         headers=headers,
-        json={"date": "2026-10-19", "time": "09:00"},
+        json={"date": "2030-01-07", "time": "09:00"},
     )
     assert book1.status_code == 201
     appt1_id = book1.get_json()["appointment"]["_id"]
@@ -1216,7 +1217,7 @@ def test_appointment_cancelled_slot_can_be_rebooked_immediately(app_client):
     book2 = client.post(
         "/api/v1/customer/appointments",
         headers=headers,
-        json={"date": "2026-10-19", "time": "09:00"},
+        json={"date": "2030-01-07", "time": "09:00"},
     )
     assert book2.status_code == 201
     assert book2.get_json()["appointment"]["status"] == "confirmed"
@@ -1225,7 +1226,7 @@ def test_appointment_cancelled_slot_can_be_rebooked_immediately(app_client):
     book3 = client.post(
         "/api/v1/customer/appointments",
         headers=headers,
-        json={"date": "2026-10-19", "time": "09:00"},
+        json={"date": "2030-01-07", "time": "09:00"},
     )
     assert book3.status_code == 409
 
@@ -1827,3 +1828,67 @@ def test_legacy_unique_index_duplicate_key_safety_and_cancelled_handling(app_cli
     assert res.status_code == 409
     assert res.get_json()["error"] == "booking_unavailable"
     assert "just booked" in res.get_json()["message"]
+
+
+def test_contact_fallback_uses_verified_email_and_preserves_tenant_isolation(app_client):
+    """
+    1. Confirm that admin@blackintel.com is never exposed as the public fallback contact.
+    2. Confirm that Black Intel tenant uses verified official email abhishek.managerr@gmail.com.
+    3. Confirm that genuine tenant-specific contact emails are preserved.
+    4. Confirm that third-party tenants without contact emails do not leak Black Intel's contact info.
+    """
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    app = client.application
+    db = app.extensions["mongo_db"]
+
+    with app.app_context():
+        # Case A: Black Intel tenant with placeholder admin@blackintel.com
+        bi_tenant_id = db.tenants.insert_one({"name": "Black Intel Demo", "slug": "black-intel-demo"}).inserted_id
+        db.business_profiles.insert_one({
+            "tenant_id": bi_tenant_id,
+            "name": "Black Intel Demo",
+            "contact_email": "admin@blackintel.com",
+        })
+        res_a = respond(str(bi_tenant_id), "What is the weather today?")
+        assert "admin@blackintel.com" not in res_a["answer"], "Placeholder admin@blackintel.com must never be exposed"
+        assert "abhishek.managerr@gmail.com" in res_a["answer"], "Must use verified official contact fallback"
+
+        # Case B: Black Intel tenant with no contact email configured
+        bi_no_email_id = db.tenants.insert_one({"name": "Black Intel", "slug": "black-intel-live"}).inserted_id
+        db.business_profiles.insert_one({
+            "tenant_id": bi_no_email_id,
+            "name": "Black Intel",
+        })
+        res_b = respond(str(bi_no_email_id), "py code do")
+        assert "abhishek.managerr@gmail.com" in res_b["answer"]
+        assert "admin@blackintel.com" not in res_b["answer"]
+
+        # Case C: Custom tenant with its own verified contact email
+        tenant_one_id = str(tenants[0][1])
+        res_c = respond(tenant_one_id, "wt ky hots ha")
+        assert "tenant-one@example.com" in res_c["answer"]
+        assert "abhishek.managerr@gmail.com" not in res_c["answer"], "Must not leak Black Intel contact to Tenant One"
+        assert "admin@blackintel.com" not in res_c["answer"]
+
+        # Case D: Custom tenant without any contact email configured
+        tenant_two_id = str(tenants[1][1])
+        db.business_profiles.update_one({"tenant_id": tenants[1][1]}, {"$unset": {"contact_email": ""}})
+        res_d = respond(tenant_two_id, "What is the weather today?")
+        assert res_d["answer"] == "I do not have confirmed information about that."
+        assert "abhishek.managerr@gmail.com" not in res_d["answer"], "Must not leak Black Intel contact to Tenant Two"
+        assert "admin@blackintel.com" not in res_d["answer"]
+
+
+def test_customer_booking_panel_contains_appointment_helper_text(app_client):
+    """
+    Verify that the customer booking form in the frontend contains the required helper text:
+    Hours: Monday–Friday, 09:00–17:00 IST · Consultation: 30 minutes · Buffer: 15 minutes
+    """
+    client, _ = app_client
+    response = client.get("/")
+    assert response.status_code == 200
+    html = response.get_data(as_text=True)
+    expected_note = "Hours: Monday–Friday, 09:00–17:00 IST · Consultation: 30 minutes · Buffer: 15 minutes"
+    assert expected_note in html, "Customer booking panel must display the appointment helper text"

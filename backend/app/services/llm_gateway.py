@@ -195,6 +195,31 @@ def _format_citation(item: dict) -> str:
     return title
 
 
+OFFICIAL_BLACK_INTEL_CONTACT_EMAIL = "abhishek.managerr@gmail.com"
+PLACEHOLDER_CONTACT_EMAILS = {"admin@blackintel.com"}
+
+
+def _resolve_contact_email(profile: dict) -> str | None:
+    """Resolve a verified public contact email, avoiding placeholder demo addresses and cross-tenant leakage."""
+    raw_email = (profile.get("contact_email") or "").strip()
+    business_name = (profile.get("name") or "").strip()
+    is_black_intel = "black intel" in business_name.lower() or not business_name
+
+    if raw_email in PLACEHOLDER_CONTACT_EMAILS:
+        # Never expose the demo operator placeholder email as a public contact
+        return OFFICIAL_BLACK_INTEL_CONTACT_EMAIL if is_black_intel else None
+
+    if raw_email:
+        # Preserve genuine tenant-specific configured contact email
+        return raw_email
+
+    # If missing and this is Black Intel, fall back to the verified official email
+    if is_black_intel:
+        return OFFICIAL_BLACK_INTEL_CONTACT_EMAIL
+
+    return None
+
+
 def _local_fallback_response(tenant_id: str, context: list[dict], profile: dict, intent: str) -> dict:
     if context:
         source = context[0]
@@ -204,7 +229,7 @@ def _local_fallback_response(tenant_id: str, context: list[dict], profile: dict,
         citation = _format_citation(source)
         return {"answer": answer, "citations": [citation] if citation else [], "intent": intent, "provider": "local"}
 
-    contact = profile.get("contact_email")
+    contact = _resolve_contact_email(profile)
     fallback = "I do not have confirmed information about that."
     if contact:
         fallback += f" Please contact the team at {contact}."
@@ -221,7 +246,7 @@ def respond(
     profile = current_app.extensions["mongo_db"].business_profiles.find_one({"tenant_id": object_id(tenant_id)}) or {}
     business_name = profile.get("name") or "Black Intel"
     business_desc = profile.get("description") or ""
-    contact_email = profile.get("contact_email")
+    contact_email = _resolve_contact_email(profile)
 
     context = _context_from_history(tenant_id, message, history)
     lowered = message.lower()

@@ -31,6 +31,7 @@
 .customer-panel h2{color:#f5f2e8;font-size:20px}
 .customer-panel .eyebrow{color:var(--accent);letter-spacing:.12em;font-weight:800}
 .customer-booking-panel{border-color:#5e4c1a}
+.customer-booking-note{color:#b4ac9a;font-size:12px;line-height:1.5;margin:8px 0 14px}
 .customer-booking{background:#111111;border:1px solid #3d341c;border-radius:8px;padding:18px;display:grid;gap:12px}
 .customer-booking label{color:#e5dec9;font-size:12px;font-weight:700;display:grid;gap:6px}
 .customer-booking input[type="date"],.customer-booking input[type="time"]{background:#080808;border:1px solid #5e4c1a;border-radius:6px;color:#f5f2e8;min-height:44px;padding:10px 14px;font-size:14px;color-scheme:dark;transition:border-color .18s ease,box-shadow .18s ease}
