@@ -38,8 +38,16 @@ def _auth_rate_limit(view):
 def _payload(model):
     try:
         return model.model_validate(request.get_json(silent=True) or {}), None
-    except ValidationError:
-        return None, (jsonify({"error": "validation_error", "message": "Please check the required fields."}), 400)
+    except ValidationError as err:
+        field_errors = {}
+        msg = "Please check the required fields."
+        for error in err.errors():
+            loc = error.get("loc", ())
+            if loc:
+                field_errors[str(loc[0])] = error.get("msg", "Invalid value")
+        if "Passwords do not match" in str(err):
+            msg = "Passwords do not match."
+        return None, (jsonify({"error": "validation_error", "message": msg, "fields": field_errors}), 400)
 
 
 def _tenant_oid():

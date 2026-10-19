@@ -59,10 +59,12 @@ def retrieve(tenant_id: str, question: str, limit: int = 4) -> list[dict]:
         if pricing_question and not (source_words & PRICE_TERMS):
             continue
         score = len(meaningful & source_words) * 3
+        title_matches = len(meaningful & _words(source["title"]))
+        score += title_matches * 4
         if service_question and source["kind"] in {"service", "faq", "knowledge"}:
             if source["kind"] == "service" or (_words(source["title"]) & SERVICE_TERMS):
                 score += 2
-            if meaningful & _words(source["title"]):
+            if title_matches > 0:
                 score += 2
             elif not meaningful and (source["kind"] == "service" or (source_words & SERVICE_TERMS)):
                 score += 1

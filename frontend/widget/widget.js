@@ -3,7 +3,61 @@ let conversationId;
 let appointment = null; // Intentionally memory-only: never stored or placed in a URL.
 let businessTimeZone = 'UTC';
 const $ = selector => document.querySelector(selector);
-const msg = (text, who = 'agent') => { const element = document.createElement('div'); element.className = 'msg ' + who; element.textContent = text; $('#messages').append(element); element.scrollIntoView({block: 'nearest'}); };
+function renderMarkdown(rawText) {
+  if (!rawText || typeof rawText !== 'string') return '';
+  const escapeHtml = str => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const codeBlocks = [];
+  let text = rawText.replace(/```([a-zA-Z0-9_\-\.]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push(`<pre><code class="language-${escapeHtml(lang)}">${escapeHtml(code.trim())}</code></pre>`);
+    return `@@CODE_BLOCK_${idx}@@`;
+  });
+  const inlineCodes = [];
+  text = text.replace(/`([^`\n]+)`/g, (_, code) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
+    return `@@INLINE_CODE_${idx}@@`;
+  });
+  text = escapeHtml(text);
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
+  const lines = text.split('\n');
+  const processed = [];
+  let inUl = false;
+  let inOl = false;
+  for (let line of lines) {
+    const headingMatch = line.match(/^(\s*)(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      if (inUl) { processed.push('</ul>'); inUl = false; }
+      if (inOl) { processed.push('</ol>'); inOl = false; }
+      const level = Math.min(headingMatch[2].length + 1, 4);
+      processed.push(`<h${level} class="md-heading">${headingMatch[3]}</h${level}>`);
+      continue;
+    }
+    const ulMatch = line.match(/^(\s*)[-*]\s+(.+)$/);
+    const olMatch = line.match(/^(\s*)\d+\.\s+(.+)$/);
+    if (ulMatch) {
+      if (inOl) { processed.push('</ol>'); inOl = false; }
+      if (!inUl) { processed.push('<ul>'); inUl = true; }
+      processed.push(`<li>${ulMatch[2]}</li>`);
+    } else if (olMatch) {
+      if (inUl) { processed.push('</ul>'); inUl = false; }
+      if (!inOl) { processed.push('<ol>'); inOl = true; }
+      processed.push(`<li>${olMatch[2]}</li>`);
+    } else {
+      if (inUl) { processed.push('</ul>'); inUl = false; }
+      if (inOl) { processed.push('</ol>'); inOl = false; }
+      processed.push(line);
+    }
+  }
+  if (inUl) processed.push('</ul>');
+  if (inOl) processed.push('</ol>');
+  text = processed.join('\n');
+  inlineCodes.forEach((html, idx) => { text = text.replace(`@@INLINE_CODE_${idx}@@`, html); });
+  codeBlocks.forEach((html, idx) => { text = text.replace(`@@CODE_BLOCK_${idx}@@`, html); });
+  return text;
+}
+const msg = (text, who = 'agent') => { const element = document.createElement('div'); element.className = 'msg ' + who; if (who === 'agent') { element.innerHTML = renderMarkdown(text); } else { element.textContent = text; } $('#messages').append(element); element.scrollIntoView({block: 'nearest'}); };
 const status = (text = '', error = false) => { const element = $('#appointment-status'); element.textContent = text; element.classList.toggle('error', error); };
 const typing = visible => { let element = $('#typing'); if (visible && !element) { element = document.createElement('div'); element.id = 'typing'; element.className = 'typing'; element.innerHTML = '<i></i> Agent is preparing a response'; $('#messages').append(element); element.scrollIntoView({block: 'nearest'}); } if (!visible && element) element.remove(); };
 const req = async (path, options = {}) => { const response = await fetch('/api/v1' + path, {headers: {'Content-Type': 'application/json', 'X-Widget-Key': key}, ...options}); const data = await response.json(); if (!response.ok) throw Error(data.message || 'Request failed'); return data; };

@@ -130,10 +130,56 @@ def _parse_start(tenant_id: str, value: str) -> tuple[datetime | None, str | Non
 def customer_requested_start(tenant_id: str, date_text: str, time_text: str) -> tuple[datetime | None, str | None]:
     try:
         target = _parse_calendar_date(date_text)
-        requested_time = datetime.strptime(str(time_text), "%H:%M").time()
+        raw_time = str(time_text).strip()
+        if not raw_time:
+            return None, "Choose a valid appointment date and time."
+        normalized = raw_time.replace("a.m.", "AM").replace("p.m.", "PM").replace("A.M.", "AM").replace("P.M.", "PM")
+        has_meridiem = "AM" in normalized.upper() or "PM" in normalized.upper()
+        requested_time = None
+        for fmt in (
+            "%H:%M",
+            "%H:%M:%S",
+            "%I:%M %p",
+            "%I:%M%p",
+            "%I:%M:%S %p",
+            "%I:%M:%S%p",
+            "%I %p",
+            "%I%p",
+        ):
+            try:
+                requested_time = datetime.strptime(normalized.upper(), fmt).time()
+                break
+            except ValueError:
+                continue
+        if requested_time is None:
+            return None, "Choose a valid appointment date and time."
+        if not has_meridiem and requested_time.hour <= 11:
+            pm_hour = requested_time.hour + 12
+            if pm_hour <= 23:
+                db = current_app.extensions.get("mongo_db")
+                rule = None
+                if db is not None:
+                    try:
+                        rule = db.business_hours.find_one(
+                            {"tenant_id": object_id(tenant_id), "weekday": target.weekday(), "enabled": True}
+                        )
+                    except Exception:
+                        rule = None
+                if rule:
+                    try:
+                        opening = datetime.strptime(rule["start_time"], "%H:%M").time()
+                        closing = datetime.strptime(rule["end_time"], "%H:%M").time()
+                        pm_time = requested_time.replace(hour=pm_hour)
+                        if requested_time < opening and pm_time <= closing:
+                            requested_time = pm_time
+                    except Exception:
+                        pass
+                elif 1 <= requested_time.hour <= 7:
+                    requested_time = requested_time.replace(hour=pm_hour)
     except (TypeError, ValueError):
         return None, "Choose a valid appointment date and time."
     tz = _zone(tenant_id)
+    requested_time = requested_time.replace(second=0, microsecond=0)
     start = datetime.combine(target, requested_time, tz)
     # Reject local wall times that do not survive a timezone round trip (DST gaps).
     round_trip = start.astimezone(timezone.utc).astimezone(tz)
@@ -154,6 +200,8 @@ def _requested_time_error(tenant_id: str, start: datetime, exclude_appointment_i
         {"tenant_id": object_id(tenant_id), "weekday": start.weekday(), "enabled": True}
     )
     if not rule:
+        if start.weekday() in (5, 6):
+            return "The business is not available on that date (closed on weekends). Choose another date."
         return "The business is not available on that date. Choose another date."
     opening = datetime.combine(start.date(), datetime.strptime(rule["start_time"], "%H:%M").time(), tz)
     closing = datetime.combine(start.date(), datetime.strptime(rule["end_time"], "%H:%M").time(), tz)

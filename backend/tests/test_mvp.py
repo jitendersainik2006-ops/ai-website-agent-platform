@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 import mongomock
+from bson import ObjectId
 import pytest
 
 from app import create_app
@@ -13,10 +14,18 @@ def app_client():
     # The MVP limiter is process-local. Clear it so one isolated Flask app does
     # not inherit request counts from an earlier test app.
     from app.api.public import _requests
+    from app.api.customer import _auth_requests
 
     _requests.clear()
+    _auth_requests.clear()
     app = create_app(
-        {"TESTING": True, "SECRET_KEY": "s" * 32, "JWT_SECRET_KEY": "j" * 32, "MONGODB_DATABASE": "mvp_tests"},
+        {
+            "TESTING": True,
+            "SECRET_KEY": "s" * 32,
+            "JWT_SECRET_KEY": "j" * 32,
+            "MONGODB_DATABASE": "mvp_tests",
+            "LLM_PROVIDER": "local",
+        },
         mongomock.MongoClient(),
     )
     db = app.extensions["mongo_db"]
@@ -898,3 +907,923 @@ def test_admin_availability_slots_and_reschedule_validation(app_client):
     assert valid_res.status_code == 200
     assert valid_res.get_json()["status"] == "rescheduled"
     assert valid_res.get_json()["history"][-1]["action"] == "admin_rescheduled"
+
+
+def test_appointment_intent_disambiguation_for_technical_queries():
+    from app.services.llm_gateway import is_appointment_intent
+
+    # Technical questions mentioning 'schedule' or 'meet' must NOT trigger appointment guidance
+    assert not is_appointment_intent("How do I schedule a cron job in Linux?")
+    assert not is_appointment_intent("Explain CPU scheduling algorithms such as round robin")
+    assert not is_appointment_intent("Where do parallel lines meet?")
+    assert not is_appointment_intent("Do two perpendicular lines meet at a right angle?")
+    assert not is_appointment_intent("How can I schedule background tasks in Celery and Python?")
+    assert not is_appointment_intent("Write a Python script to generate meeting minutes")
+    assert not is_appointment_intent("Explain the meet-in-the-middle cryptographic attack")
+
+    # Legitimate appointment and booking questions must trigger appointment intent
+    assert is_appointment_intent("Please book me an appointment tomorrow at 9am")
+    assert is_appointment_intent("Can we meet on 2030-01-07 at 09:00?")
+    assert is_appointment_intent("Can I schedule a consultation?")
+    assert is_appointment_intent("Do you have any available slots?")
+    assert is_appointment_intent("I would like to reschedule my appointment")
+    assert is_appointment_intent("I want to book an appointment with your Python consulting team")
+
+
+def test_ai_provider_gemini_mocked_completion(app_client, monkeypatch):
+    import json
+    import urllib.request
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    client.application.config.update({
+        "LLM_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "test-gemini-key",
+        "GEMINI_MODEL": "gemini-2.0-flash",
+    })
+
+    mock_response_payload = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"text": "```python\ndef binary_search(arr, target):\n    # implementation\n    return -1\n```"}
+                    ]
+                }
+            }
+        ]
+    }
+
+    class MockHTTPResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return json.dumps(mock_response_payload).encode("utf-8")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: MockHTTPResponse())
+
+    with client.application.app_context():
+        result = respond(tenant_id, "Write a python function to binary search")
+        assert result["provider"] == "gemini"
+        assert "def binary_search" in result["answer"]
+        assert result["intent"] == "general"
+
+
+def test_ai_provider_groq_mocked_completion(app_client, monkeypatch):
+    import json
+    import urllib.request
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    client.application.config.update({
+        "LLM_PROVIDER": "groq",
+        "GROQ_API_KEY": "test-groq-key",
+        "GROQ_MODEL": "llama-3.3-70b-versatile",
+    })
+
+    mock_response_payload = {
+        "choices": [
+            {
+                "message": {
+                    "content": "Newton's Third Law states that for every action, there is an equal and opposite reaction."
+                }
+            }
+        ]
+    }
+
+    class MockHTTPResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return json.dumps(mock_response_payload).encode("utf-8")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: MockHTTPResponse())
+
+    with client.application.app_context():
+        result = respond(tenant_id, "Explain Newton's third law of motion")
+        assert result["provider"] == "groq"
+        assert "equal and opposite" in result["answer"]
+
+
+def test_ai_provider_graceful_fallback_to_local_on_network_failure(app_client, monkeypatch):
+    import urllib.error
+    import urllib.request
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    client.application.config.update({
+        "LLM_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "test-key",
+    })
+
+    def mock_urlopen_failure(req, timeout=None):
+        raise urllib.error.URLError("Network connection timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen_failure)
+
+    with client.application.app_context():
+        result = respond(tenant_id, "What is the capital of Mars?")
+        assert result["provider"] == "local"
+        assert "confirmed information" in result["answer"].lower()
+
+
+def test_tenant_isolation_in_ai_system_prompt(app_client, monkeypatch):
+    import json
+    import urllib.request
+
+    client, tenants = app_client
+    tenant1_id = tenants[0][1]
+    tenant2_id = tenants[1][1]
+    db = client.application.extensions["mongo_db"]
+
+    db.knowledge.insert_one({
+        "tenant_id": tenant1_id,
+        "title": "Tenant One Confidential Capability",
+        "content": "Tenant One exclusively provides Quantum Shielding.",
+        "status": "published",
+    })
+    db.knowledge.insert_one({
+        "tenant_id": tenant2_id,
+        "title": "Tenant Two Secret Operation",
+        "content": "Tenant Two exclusively runs Project Horizon.",
+        "status": "published",
+    })
+
+    captured_payloads = []
+
+    class MockHTTPResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return json.dumps({"candidates": [{"content": {"parts": [{"text": "Mock AI answer"}]}}]}).encode("utf-8")
+
+    def mock_urlopen(req, timeout=None):
+        captured_payloads.append(json.loads(req.data.decode("utf-8")))
+        return MockHTTPResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    client.application.config.update({
+        "LLM_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "test-key",
+    })
+
+    res1 = client.post("/api/v1/chat", headers={"X-Widget-Key": "tenant-one-key"}, json={"message": "What is Quantum Shielding?"})
+    assert res1.status_code == 200
+    assert captured_payloads
+    prompt1 = captured_payloads[0]["system_instruction"]["parts"][0]["text"]
+    assert "Tenant One" in prompt1
+    assert "Quantum Shielding" in prompt1
+    assert "Tenant Two" not in prompt1
+    assert "Project Horizon" not in prompt1
+
+
+def test_customer_portal_chat_with_configured_ai_provider(app_client, monkeypatch):
+    import json
+    import urllib.request
+
+    client, tenants = app_client
+    headers, _ = customer_auth(client, "tenant-one-key", "General Chat Customer")
+
+    client.application.config.update({
+        "LLM_PROVIDER": "groq",
+        "GROQ_API_KEY": "test-groq-key",
+    })
+
+    class MockHTTPResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return json.dumps({
+                "choices": [{"message": {"content": "Photosynthesis is the process used by plants to convert light into chemical energy."}}]
+            }).encode("utf-8")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: MockHTTPResponse())
+
+    chat_res = client.post(
+        "/api/v1/customer/chat",
+        headers=headers,
+        json={"message": "How does photosynthesis work?"},
+    )
+    assert chat_res.status_code == 200
+    data = chat_res.get_json()
+    assert data["provider"] == "groq"
+    assert "Photosynthesis" in data["answer"]
+
+
+def test_optional_web_search_augmentation(app_client, monkeypatch):
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    client.application.config.update({
+        "LLM_PROVIDER": "local",
+        "WEB_SEARCH_ENABLED": True,
+    })
+
+    from app.services import web_search_service
+    monkeypatch.setattr(
+        web_search_service,
+        "search_web",
+        lambda query, limit=2: [{"title": "Quantum computing", "snippet": "A type of computation...", "url": "https://en.wikipedia.org/wiki/Quantum_computing"}]
+    )
+
+    with client.application.app_context():
+        res = respond(tenant_id, "Tell me about quantum computing")
+        assert res["provider"] == "local"
+
+
+def test_personalized_customer_chat_and_neutral_fallback(app_client):
+    client, _ = app_client
+    # Authenticated customer with server-verified name
+    headers, _ = customer_auth(client, "tenant-one-key", full_name="Aarav Sharma")
+    res1 = client.post("/api/v1/customer/chat", headers=headers, json={"message": "hello"})
+    assert res1.status_code == 200
+    assert "Hello Aarav Sharma." in res1.get_json()["answer"]
+
+    # Even if client tries to spoof customer_name in payload, server-verified session name is used
+    res_spoof = client.post("/api/v1/customer/chat", headers=headers, json={"message": "hello", "customer_name": "SpoofedName"})
+    assert res_spoof.status_code == 200
+    assert "SpoofedName" not in res_spoof.get_json()["answer"]
+    assert "Hello Aarav Sharma." in res_spoof.get_json()["answer"]
+
+    # Public visitor without authenticated account gets neutral greeting
+    pub_res = client.post("/api/v1/chat", headers={"X-Widget-Key": "tenant-one-key"}, json={"message": "hello"})
+    assert pub_res.status_code == 200
+    assert pub_res.get_json()["answer"].startswith("Hello. I can help with")
+
+
+def test_customer_portal_appointment_booking_guidance_references_form(app_client):
+    client, _ = app_client
+    headers, _ = customer_auth(client, "tenant-one-key", full_name="Maya Patel")
+    chat = client.post(
+        "/api/v1/customer/chat",
+        headers=headers,
+        json={"message": "I would like to schedule a consultation with your security team"},
+    )
+    assert chat.status_code == 200
+    data = chat.get_json()
+    assert data["intent"] == "appointment"
+    assert "booking form" in data["answer"].lower()
+    assert "Maya Patel" in data["answer"]
+    # Never claim appointment was booked from chat
+    assert "cannot" in data["answer"].lower()
+
+
+def test_appointment_cancelled_slot_can_be_rebooked_immediately(app_client):
+    client, _ = app_client
+    headers, _ = customer_auth(client, "tenant-one-key", full_name="Rohan Verma")
+    slot_res = client.get("/api/v1/customer/availability/slots?date=2026-10-19", headers=headers)
+    assert slot_res.status_code == 200
+    slots = slot_res.get_json()["slots"]
+    assert slots, "Expected offered slots on Monday"
+    target_slot = slots[0]
+
+    # Book the slot
+    book1 = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers,
+        json={"date": "2026-10-19", "time": "09:00"},
+    )
+    assert book1.status_code == 201
+    appt1_id = book1.get_json()["appointment"]["_id"]
+
+    # Cancel the appointment
+    cancel = client.post(f"/api/v1/customer/appointments/{appt1_id}/cancel", headers=headers)
+    assert cancel.status_code == 200
+    assert cancel.get_json()["appointment"]["status"] == "cancelled"
+
+    # Rebook the exact same slot that was freed up
+    book2 = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers,
+        json={"date": "2026-10-19", "time": "09:00"},
+    )
+    assert book2.status_code == 201
+    assert book2.get_json()["appointment"]["status"] == "confirmed"
+
+    # Attempting to double-book the now-active appointment must fail with 409
+    book3 = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers,
+        json={"date": "2026-10-19", "time": "09:00"},
+    )
+    assert book3.status_code == 409
+
+
+def test_customer_requested_time_accepts_seconds_format(app_client):
+    client, _ = app_client
+    from app.services.scheduling_service import customer_requested_start
+    db = client.application.extensions["mongo_db"]
+    tenant = str(db.tenants.find_one({"slug": "tenant-one"})["_id"])
+
+    with client.application.app_context():
+        # Standard HH:MM
+        start1, err1 = customer_requested_start(tenant, "2026-10-19", "10:30")
+        assert err1 is None
+        assert start1.hour == 10 and start1.minute == 30 and start1.second == 0
+
+        # Browser HH:MM:SS format
+        start2, err2 = customer_requested_start(tenant, "2026-10-19", "10:30:00")
+        assert err2 is None
+        assert start2.hour == 10 and start2.minute == 30 and start2.second == 0
+
+        # Invalid time format fails cleanly
+        _, err3 = customer_requested_start(tenant, "2026-10-19", "invalid-time")
+        assert err3 == "Choose a valid appointment date and time."
+
+
+def test_official_black_intel_knowledge_synchronization_and_coverage(app_client):
+    client, _ = app_client
+    from app.services.official_knowledge import sync_official_knowledge
+    from app.services.knowledge_service import retrieve
+    db = client.application.extensions["mongo_db"]
+    tenant = db.tenants.find_one({"slug": "tenant-one"})["_id"]
+
+    # Sync all verified official records from theblackintel.com
+    count = sync_official_knowledge(db, tenant)
+    assert count >= 14
+
+    # Verify specialized retrieval within app context
+    with client.application.app_context():
+        leadership = retrieve(str(tenant), "Who is Aryan Kumar?")
+        assert leadership
+        assert "leadership" in leadership[0]["title"].lower() or "aryan" in leadership[0]["content"].lower()
+        assert leadership[0]["source_url"] == "https://theblackintel.com/about/leadership"
+
+        mobile = retrieve(str(tenant), "Do you do mobile investigations?")
+        assert mobile
+        assert "mobile" in mobile[0]["title"].lower()
+        assert mobile[0]["source_url"] == "https://theblackintel.com/services/mobile-investigations"
+
+        contact = retrieve(str(tenant), "How can I contact Black Intel?")
+        assert contact
+        assert "contact" in contact[0]["title"].lower()
+        assert "abhishek.managerr@gmail.com" in contact[0]["content"]
+        assert "+91 9205105369" in contact[0]["content"]
+
+        pricing = retrieve(str(tenant), "What is your pricing?")
+        assert pricing
+        assert "pricing" in pricing[0]["title"].lower()
+        assert "consultation" in pricing[0]["content"].lower()
+
+
+
+def test_favicon_and_logo_static_routes(app_client):
+    client, _ = app_client
+    fav = client.get("/favicon.ico")
+    assert fav.status_code == 200
+    assert fav.mimetype == "image/png"
+
+    logo = client.get("/black-intel-logo.png")
+    assert logo.status_code == 200
+    assert logo.mimetype == "image/png"
+
+
+def test_customer_auth_field_validation_and_confirm_password(app_client):
+    client, _ = app_client
+
+    # 1. Missing fields
+    res = client.post("/api/v1/customer/auth/register", json={})
+    assert res.status_code == 400
+    assert res.get_json()["error"] == "validation_error"
+
+    # 2. Mismatched passwords
+    mismatch = client.post(
+        "/api/v1/customer/auth/register",
+        json={
+            "full_name": "Rohan Verma",
+            "age": 30,
+            "reason": "Cyber investigation",
+            "password": "Password123!",
+            "confirm_password": "DifferentPassword123!",
+            "widget_key": "tenant-one-key",
+        },
+    )
+    assert mismatch.status_code == 400
+    assert "Passwords do not match." in mismatch.get_json()["message"]
+
+    # 3. Valid registration with confirm_password
+    valid_reg = client.post(
+        "/api/v1/customer/auth/register",
+        json={
+            "full_name": "Rohan Verma",
+            "age": 30,
+            "reason": "Cyber investigation",
+            "password": "Password123!",
+            "confirm_password": "Password123!",
+            "widget_key": "tenant-one-key",
+        },
+    )
+    assert valid_reg.status_code == 201
+    customer_id = valid_reg.get_json()["customer"]["customer_id"]
+
+    # 4. Login with invalid password
+    bad_login = client.post(
+        "/api/v1/customer/auth/login",
+        json={
+            "full_name": "Rohan Verma",
+            "customer_id": customer_id,
+            "password": "WrongPassword123!",
+            "widget_key": "tenant-one-key",
+        },
+    )
+    assert bad_login.status_code == 401
+    assert "Invalid customer credentials" in bad_login.get_json()["message"]
+
+    # 5. Login with malformed customer_id
+    bad_id = client.post(
+        "/api/v1/customer/auth/login",
+        json={
+            "full_name": "Rohan Verma",
+            "customer_id": "NOT-VALID",
+            "password": "Password123!",
+            "widget_key": "tenant-one-key",
+        },
+    )
+    assert bad_id.status_code == 400
+
+
+def test_customer_appointment_booking_edge_cases_and_persistence(app_client, monkeypatch):
+    client, _ = app_client
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 6, 12, tzinfo=timezone.utc))
+    db = client.application.extensions["mongo_db"]
+
+    headers_a, user_a = customer_auth(client, "tenant-one-key", "User Alpha")
+    headers_b, user_b = customer_auth(client, "tenant-one-key", "User Beta")
+
+    # 1. Valid booking on open weekday (Monday 2030-01-07 09:00)
+    book_a = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_a,
+        json={"date": "2030-01-07", "time": "09:00"},
+    )
+    assert book_a.status_code == 201
+    appt_a = book_a.get_json()["appointment"]
+    appt_a_id = appt_a["_id"]
+
+    # Verify persistence in database
+    persisted = db.appointments.find_one({"_id": ObjectId(appt_a_id)})
+    assert persisted is not None
+    assert persisted["status"] == "confirmed"
+    assert persisted["customer_id"] == user_a["customer"]["customer_id"]
+
+    # 2. Closed business day (weekend Saturday 2030-01-05)
+    closed_check = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_b,
+        json={"date": "2030-01-12", "time": "09:00"},
+    )
+    assert closed_check.status_code == 409
+    assert "business is not available on that date" in closed_check.get_json()["message"]
+    assert "weekends" in closed_check.get_json()["message"]
+
+    # 3. Outside business hours (Monday 2030-01-07 06:00)
+    outside_check = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_b,
+        json={"date": "2030-01-07", "time": "06:00"},
+    )
+    assert outside_check.status_code == 409
+    assert "outside business hours" in outside_check.get_json()["message"]
+
+    # 4. Past time (Sunday 2030-01-06 09:00, when simulated now is 12:00)
+    past_check = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_b,
+        json={"date": "2030-01-06", "time": "09:00"},
+    )
+    assert past_check.status_code == 409
+    assert "in the past" in past_check.get_json()["message"]
+
+    # 5. Conflicting appointment (User B tries to book the same slot held by User A)
+    conflict_check = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_b,
+        json={"date": "2030-01-07", "time": "09:00"},
+    )
+    assert conflict_check.status_code == 409
+    assert "conflicts with an existing appointment" in conflict_check.get_json()["message"]
+
+    # 6. Cancelled slot rebooking (User A cancels, User B books the now-freed slot)
+    cancel_a = client.post(f"/api/v1/customer/appointments/{appt_a_id}/cancel", headers=headers_a)
+    assert cancel_a.status_code == 200
+    assert cancel_a.get_json()["appointment"]["status"] == "cancelled"
+
+    book_freed = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_b,
+        json={"date": "2030-01-07", "time": "09:00"},
+    )
+    assert book_freed.status_code == 201
+    appt_b_id = book_freed.get_json()["appointment"]["_id"]
+    persisted_b = db.appointments.find_one({"_id": ObjectId(appt_b_id)})
+    assert persisted_b is not None
+    assert persisted_b["status"] == "confirmed"
+
+    # 7. Customer reschedule to another valid slot (User B reschedules to 09:30)
+    resched_b = client.post(
+        f"/api/v1/customer/appointments/{appt_b_id}/reschedule",
+        headers=headers_b,
+        json={"date": "2030-01-07", "time": "09:30"},
+    )
+    assert resched_b.status_code == 200
+    assert resched_b.get_json()["appointment"]["status"] == "rescheduled"
+    updated_b = db.appointments.find_one({"_id": ObjectId(appt_b_id)})
+    assert updated_b["status"] == "rescheduled"
+    assert any(h.get("action") == "customer_rescheduled" for h in updated_b["history"])
+
+    # 8. Customer authorization / Tenant isolation: User A cannot cancel or reschedule User B's appointment
+    unauth_cancel = client.post(f"/api/v1/customer/appointments/{appt_b_id}/cancel", headers=headers_a)
+    assert unauth_cancel.status_code in (403, 404)
+    assert "not authorized" in unauth_cancel.get_json()["message"]
+
+    unauth_resched = client.post(
+        f"/api/v1/customer/appointments/{appt_b_id}/reschedule",
+        headers=headers_a,
+        json={"date": "2030-01-08", "time": "09:00"},
+    )
+    assert unauth_resched.status_code in (403, 404)
+    assert "not authorized" in unauth_resched.get_json()["message"]
+
+
+def test_appointment_validation_regression_suite(app_client, monkeypatch):
+    """
+    Regression test suite verifying appointment booking validation requirements:
+    1. Monday at 10:00 AM (valid).
+    2. Monday at 3:30 PM (valid in 24h '15:30', 12h '3:30 PM', '03:30 PM', and bare '3:30' / '03:30').
+    3. The latest valid appointment of the day (16:30 ending at 17:00).
+    4. A time that does not leave enough consultation time before closing (16:45 ending at 17:15).
+    5. A weekend time (Saturday).
+    6. A past time.
+    7. A conflicting appointment and its required buffer.
+    """
+    client, _ = app_client
+    # Freeze time to Sunday 2030-01-06 12:00:00 UTC
+    monkeypatch.setattr("app.services.scheduling_service.now", lambda: datetime(2030, 1, 6, 12, tzinfo=timezone.utc))
+    db = client.application.extensions["mongo_db"]
+    tenant = db.tenants.find_one({"slug": "tenant-one"})
+    tenant_id = tenant["_id"]
+
+    # Configure business profile: Monday-Friday 09:00 to 17:00, 30 min duration, 15 min buffer
+    db.business_hours.update_many(
+        {"tenant_id": tenant_id},
+        {"$set": {"start_time": "09:00", "end_time": "17:00"}}
+    )
+    db.business_profiles.update_one(
+        {"tenant_id": tenant_id},
+        {"$set": {"appointment_duration_minutes": 30, "appointment_buffer_minutes": 15}}
+    )
+
+    headers_user1, user1 = customer_auth(client, "tenant-one-key", "Customer One")
+    headers_user2, user2 = customer_auth(client, "tenant-one-key", "Customer Two")
+
+    # 1. Monday at 10:00 AM (valid)
+    chk_10am = client.get("/api/v1/customer/availability/check?date=2030-01-07&time=10:00%20AM", headers=headers_user1)
+    assert chk_10am.status_code == 200
+    assert chk_10am.get_json()["available"] is True
+    book_10am = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_user1,
+        json={"date": "2030-01-07", "time": "10:00 AM"},
+    )
+    assert book_10am.status_code == 201
+    assert book_10am.get_json()["appointment"]["status"] == "confirmed"
+
+    # 2. Monday at 3:30 PM (valid across formats: '15:30', '3:30 PM', '03:30 PM', and bare '3:30')
+    for time_val in ("15:30", "3:30 PM", "03:30 PM", "3:30", "03:30"):
+        chk_330pm = client.get(
+            f"/api/v1/customer/availability/check?date=2030-01-07&time={time_val}",
+            headers=headers_user2,
+        )
+        assert chk_330pm.status_code == 200
+        assert chk_330pm.get_json()["available"] is True, f"Failed for time format: {time_val}"
+
+    # Book Monday at 3:30 PM
+    book_330pm = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_user2,
+        json={"date": "2030-01-07", "time": "3:30 PM"},
+    )
+    assert book_330pm.status_code == 201
+    assert book_330pm.get_json()["appointment"]["status"] == "confirmed"
+
+    # 3. Latest valid appointment of the day: 16:30 (4:30 PM, consultation finishes at 17:00 closing)
+    chk_latest = client.get(
+        "/api/v1/customer/availability/check?date=2030-01-07&time=16:30",
+        headers=headers_user1,
+    )
+    assert chk_latest.status_code == 200
+    assert chk_latest.get_json()["available"] is True
+    book_latest = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_user1,
+        json={"date": "2030-01-07", "time": "16:30"},
+    )
+    assert book_latest.status_code == 201
+    assert book_latest.get_json()["appointment"]["status"] == "confirmed"
+
+    # 4. A time that does not leave enough consultation time before closing: 16:45 (ends at 17:15)
+    chk_too_late = client.get(
+        "/api/v1/customer/availability/check?date=2030-01-07&time=16:45",
+        headers=headers_user1,
+    )
+    assert chk_too_late.status_code == 200
+    assert chk_too_late.get_json()["available"] is False
+    assert "outside business hours or does not leave enough time" in chk_too_late.get_json()["message"]
+    book_too_late = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_user1,
+        json={"date": "2030-01-07", "time": "16:45"},
+    )
+    assert book_too_late.status_code == 409
+    assert "outside business hours or does not leave enough time" in book_too_late.get_json()["message"]
+
+    # Explicit AM that is outside hours (03:30 AM) must also be blocked
+    chk_330am = client.get(
+        "/api/v1/customer/availability/check?date=2030-01-07&time=03:30%20AM",
+        headers=headers_user1,
+    )
+    assert chk_330am.status_code == 200
+    assert chk_330am.get_json()["available"] is False
+    assert "outside business hours" in chk_330am.get_json()["message"]
+
+    # 5. Weekend time (Saturday 2030-01-12)
+    chk_weekend = client.get(
+        "/api/v1/customer/availability/check?date=2030-01-12&time=10:00",
+        headers=headers_user1,
+    )
+    assert chk_weekend.status_code == 200
+    assert chk_weekend.get_json()["available"] is False
+    assert "closed on weekends" in chk_weekend.get_json()["message"]
+    book_weekend = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_user1,
+        json={"date": "2030-01-12", "time": "10:00"},
+    )
+    assert book_weekend.status_code == 409
+    assert "closed on weekends" in book_weekend.get_json()["message"]
+
+    # 6. Past time (Saturday 2030-01-05 10:00 when simulated time is Sunday 2030-01-06 12:00)
+    chk_past = client.get(
+        "/api/v1/customer/availability/check?date=2030-01-05&time=10:00",
+        headers=headers_user1,
+    )
+    assert chk_past.status_code == 200
+    assert chk_past.get_json()["available"] is False
+    assert "in the past" in chk_past.get_json()["message"]
+    book_past = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_user1,
+        json={"date": "2030-01-05", "time": "10:00"},
+    )
+    assert book_past.status_code == 409
+    assert "in the past" in book_past.get_json()["message"]
+
+    # 7. Conflicting appointment:
+    # Customer 1 has 10:00-10:30 on 2030-01-07 with 15 min buffer (blocks 09:45 - 10:45)
+    # Customer 2 attempting to book 10:00 AM
+    chk_conflict_exact = client.get(
+        "/api/v1/customer/availability/check?date=2030-01-07&time=10:00",
+        headers=headers_user2,
+    )
+    assert chk_conflict_exact.status_code == 200
+    assert chk_conflict_exact.get_json()["available"] is False
+    assert "conflicts with an existing appointment" in chk_conflict_exact.get_json()["message"]
+    book_conflict_exact = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_user2,
+        json={"date": "2030-01-07", "time": "10:00"},
+    )
+    assert book_conflict_exact.status_code == 409
+    assert "conflicts with an existing appointment" in book_conflict_exact.get_json()["message"]
+
+    # Customer 2 attempting to book during the 15-minute buffer (e.g. 10:15)
+    chk_conflict_buffer = client.get(
+        "/api/v1/customer/availability/check?date=2030-01-07&time=10:15",
+        headers=headers_user2,
+    )
+    assert chk_conflict_buffer.status_code == 200
+    assert chk_conflict_buffer.get_json()["available"] is False
+    assert "conflicts with an existing appointment" in chk_conflict_buffer.get_json()["message"]
+
+    # 8. Cancelled slot behavior without altering real customer data
+    appt_10am_id = book_10am.get_json()["appointment"]["_id"]
+    cancel_res = client.post(f"/api/v1/customer/appointments/{appt_10am_id}/cancel", headers=headers_user1)
+    assert cancel_res.status_code == 200
+    assert cancel_res.get_json()["appointment"]["status"] == "cancelled"
+    cancelled_doc = db.appointments.find_one({"_id": ObjectId(appt_10am_id)})
+    assert cancelled_doc["status"] == "cancelled"
+
+    # Slot 10:00 AM is now freed for Customer 2
+    chk_freed = client.get(
+        "/api/v1/customer/availability/check?date=2030-01-07&time=10:00",
+        headers=headers_user2,
+    )
+    assert chk_freed.status_code == 200
+    assert chk_freed.get_json()["available"] is True
+
+    # Customer 2 books the freed slot; booking persists and confirms
+    book_freed = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers_user2,
+        json={"date": "2030-01-07", "time": "10:00"},
+    )
+    assert book_freed.status_code == 201
+    persisted_freed = db.appointments.find_one({"_id": ObjectId(book_freed.get_json()["appointment"]["_id"])})
+    assert persisted_freed is not None
+    assert persisted_freed["status"] == "confirmed"
+
+    # 9. Signup validation & password requirements
+    # Short password (< 8 chars)
+    short_pwd = client.post(
+        "/api/v1/customer/auth/register",
+        json={"full_name": "Test User", "age": 25, "reason": "Test", "password": "short", "widget_key": "tenant-one-key"},
+    )
+    assert short_pwd.status_code == 400
+
+    # Invalid age (< 13)
+    bad_age = client.post(
+        "/api/v1/customer/auth/register",
+        json={"full_name": "Young User", "age": 10, "reason": "Test", "password": "Password123!", "widget_key": "tenant-one-key"},
+    )
+    assert bad_age.status_code == 400
+
+    # 10. Successful registration returns access token and unique customer ID
+    headers_reg, reg_data = customer_auth(client, "tenant-one-key", "Priya Sharma", "ValidPassword123!")
+    assert reg_data["customer"]["customer_id"] == "BI-000003"
+    assert "access_token" in reg_data
+    assert "password_hash" not in reg_data["customer"]
+
+    # 11. Login validation
+    bad_login = client.post(
+        "/api/v1/customer/auth/login",
+        json={"full_name": "Priya Sharma", "customer_id": "BI-000003", "password": "WrongPassword!", "widget_key": "tenant-one-key"},
+    )
+    assert bad_login.status_code == 401
+    assert bad_login.get_json()["error"] == "invalid_credentials"
+
+    good_login = client.post(
+        "/api/v1/customer/auth/login",
+        json={"full_name": "Priya Sharma", "customer_id": "BI-000003", "password": "ValidPassword123!", "widget_key": "tenant-one-key"},
+    )
+    assert good_login.status_code == 200
+    assert "access_token" in good_login.get_json()
+
+
+def test_mongo_create_indexes_resilience_and_conflict_handling():
+    """
+    Focused mocked test suite covering:
+    1. Existing legacy index (unique=True, no partialFilterExpression, matching Atlas).
+    2. Matching index (unique=True with partialFilterExpression).
+    3. Conflicting options (existing non-unique index preserved without dropping).
+    4. Failed index inspection (never assumed absent; skips creation safely).
+    5. Index creation failures (safe continuation, never downgraded to non-unique).
+    """
+    import mongomock
+    from unittest.mock import MagicMock
+    from pymongo.errors import OperationFailure
+    from app import _create_indexes
+
+    # 1. Existing legacy index matching MongoDB Atlas
+    legacy_db = mongomock.MongoClient().db_legacy
+    legacy_db.appointments.create_index([("tenant_id", 1), ("start_at", 1)], unique=True)
+    before_legacy = legacy_db.appointments.index_information()
+    assert "tenant_id_1_start_at_1" in before_legacy
+    assert before_legacy["tenant_id_1_start_at_1"].get("unique") is True
+
+    # Running _create_indexes must preserve legacy index without raising or altering options
+    _create_indexes(legacy_db)
+    after_legacy = legacy_db.appointments.index_information()
+    assert "tenant_id_1_start_at_1" in after_legacy
+    assert after_legacy["tenant_id_1_start_at_1"].get("unique") is True
+
+    # 2. Matching index with partialFilterExpression
+    partial_db = mongomock.MongoClient().db_partial
+    partial_db.appointments.create_index(
+        [("tenant_id", 1), ("start_at", 1)],
+        unique=True,
+        partialFilterExpression={"status": {"$in": ["confirmed", "pending", "rescheduled"]}},
+    )
+    _create_indexes(partial_db)
+    after_partial = partial_db.appointments.index_information()
+    assert any(
+        list(info.get("key", [])) == [("tenant_id", 1), ("start_at", 1)]
+        for info in after_partial.values()
+    )
+
+    # 3. Conflicting options (existing index is non-unique)
+    conflict_db = mongomock.MongoClient().db_conflict
+    conflict_db.appointments.create_index([("tenant_id", 1), ("start_at", 1)], unique=False)
+    # Must preserve the existing index, not drop or alter it
+    _create_indexes(conflict_db)
+    after_conflict = conflict_db.appointments.index_information()
+    assert any(
+        list(info.get("key", [])) == [("tenant_id", 1), ("start_at", 1)]
+        for info in after_conflict.values()
+    )
+
+    # 4. Failed index inspection (e.g. unauthorized to run listIndexes)
+    mock_db_inspect_fail = MagicMock()
+    mock_db_inspect_fail.appointments.index_information.side_effect = OperationFailure("not authorized on admin to execute command: listIndexes")
+    # When inspection fails, it must NOT treat as absent and must NOT attempt start_at index creation
+    _create_indexes(mock_db_inspect_fail)
+    start_at_inspect_calls = [
+        c for c in mock_db_inspect_fail.appointments.create_index.call_args_list
+        if c.args and c.args[0] == [("tenant_id", 1), ("start_at", 1)]
+    ]
+    assert len(start_at_inspect_calls) == 0, "Must not attempt to create start_at index when inspection fails"
+
+    # 5. Index creation failures (partial fails, standard unique fails)
+    mock_db_create_fail = MagicMock()
+    mock_db_create_fail.appointments.index_information.return_value = {}
+    mock_db_create_fail.appointments.create_index.side_effect = [
+        None,  # for customer_id start_at index in _safe_create_index
+        OperationFailure("Index option conflict", code=86),
+        OperationFailure("Index creation denied", code=13),
+    ]
+    # Must catch and continue safely without crashing startup
+    _create_indexes(mock_db_create_fail)
+    # Must never attempt a non-unique create_index call for start_at
+    start_at_create_calls = [
+        c for c in mock_db_create_fail.appointments.create_index.call_args_list
+        if c.args and c.args[0] == [("tenant_id", 1), ("start_at", 1)]
+    ]
+    assert len(start_at_create_calls) == 2, "Must attempt partial and then standard unique"
+    for call_args in start_at_create_calls:
+        assert call_args.kwargs.get("unique") is True, "Must never downgrade to non-unique"
+
+
+def test_legacy_unique_index_duplicate_key_safety_and_cancelled_handling(app_client):
+    """
+    Test duplicate-key handling and safety under an unconditional legacy unique index:
+    1. If a cancelled appointment already exists in MongoDB with a legacy unconditional
+       unique index on (tenant_id, start_at), inserting a new document at that exact
+       instant triggers a DuplicateKeyError.
+    2. create_appointment catches DuplicateKeyError and safely returns (None, error_msg),
+       never claiming the appointment was booked or returning success.
+    3. The customer portal API responds with 409 booking_unavailable, ensuring the client
+       is never misled into believing a slot was booked.
+    """
+    from app.services.scheduling_service import create_appointment
+
+    client, _ = app_client
+    app = client.application
+    db = app.extensions["mongo_db"]
+    tenant = db.tenants.find_one({"slug": "tenant-one"})
+    tenant_id = str(tenant["_id"])
+
+    # Simulate an environment with the legacy unconditional unique index
+    db.appointments.drop_indexes()
+    db.appointments.create_index([("tenant_id", 1), ("start_at", 1)], unique=True)
+
+    # Insert a cancelled appointment directly at a valid future business slot
+    start_time = datetime(2030, 1, 7, 9, 0, tzinfo=timezone.utc)
+    db.appointments.insert_one({
+        "tenant_id": tenant["_id"],
+        "start_at": start_time,
+        "end_at": start_time + timedelta(minutes=30),
+        "status": "cancelled",
+        "timezone": "UTC",
+    })
+
+    with app.app_context():
+        # Attempting to book this slot triggers DuplicateKeyError on MongoDB level
+        appt, err = create_appointment(
+            tenant_id,
+            {"start_at": start_time.isoformat(), "name": "Legacy Customer", "email": "legacy@example.com"},
+            allow_customer_requested_time=True,
+        )
+        # Must fail safely without claiming booking succeeded
+        assert appt is None
+        assert err == "That appointment slot was just booked. Please choose another time."
+
+    # Verify through customer API that 409 booking_unavailable is returned and booking never succeeds
+    headers, _ = customer_auth(client, "tenant-one-key", full_name="Legacy Customer")
+    res = client.post(
+        "/api/v1/customer/appointments",
+        headers=headers,
+        json={"date": "2030-01-07", "time": "09:00"},
+    )
+    assert res.status_code == 409
+    assert res.get_json()["error"] == "booking_unavailable"
+    assert "just booked" in res.get_json()["message"]

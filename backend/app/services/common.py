@@ -16,6 +16,8 @@ def serialize(value):
     if isinstance(value, ObjectId):
         return str(value)
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
         return value.isoformat()
     if isinstance(value, list):
         return [serialize(item) for item in value]

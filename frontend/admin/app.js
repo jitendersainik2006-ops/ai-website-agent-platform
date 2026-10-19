@@ -33,7 +33,16 @@ const calendarDateInZone = (date, timeZone) => {
 const weekdayInZone = (date, timeZone) => new Intl.DateTimeFormat('en-US', {timeZone, weekday: 'short'}).format(date);
 const nextOpenCalendarDate = timeZone => {
   const cursor = new Date();
-  for (let step = 0; step < 16; step += 1) {
+  let currentHour = 10;
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {timeZone, hour: 'numeric', hour12: false}).formatToParts(cursor);
+    const hp = parts.find(p => p.type === 'hour');
+    if (hp) currentHour = parseInt(hp.value, 10);
+  } catch (e) {
+    currentHour = cursor.getHours();
+  }
+  const startStep = currentHour >= 16 ? 1 : 0;
+  for (let step = startStep; step < 16; step += 1) {
     const candidate = new Date(cursor.getTime() + step * 24 * 60 * 60 * 1000);
     const weekday = weekdayInZone(candidate, timeZone);
     if (weekday !== 'Sat' && weekday !== 'Sun') return calendarDateInZone(candidate, timeZone);
@@ -64,11 +73,35 @@ function showLanding() { showCustomerAuth('login'); }
 
 async function login(event) {
   event.preventDefault();
-  const submit = event.currentTarget.querySelector('button[type="submit"]');
+  const form = event.currentTarget;
+  const submit = form.querySelector('button[type="submit"]');
   const spinner = submit.querySelector('.button-loader');
-  setBusy(submit, true, 'Verifying access...'); spinner.hidden = false; $('#login-error').textContent = '';
+  $('#login-error').textContent = '';
+  ['err-admin-tenant-slug', 'err-admin-email', 'err-admin-password'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = '';
+  });
+  const data = Object.fromEntries(new FormData(form));
+  let valid = true;
+  if (!data.tenant_slug || !data.tenant_slug.trim()) {
+    const el = document.getElementById('err-admin-tenant-slug');
+    if (el) el.textContent = 'Tenant workspace is required.';
+    valid = false;
+  }
+  if (!data.email || !data.email.trim() || !data.email.includes('@')) {
+    const el = document.getElementById('err-admin-email');
+    if (el) el.textContent = 'Valid work email is required.';
+    valid = false;
+  }
+  if (!data.password || !data.password.trim()) {
+    const el = document.getElementById('err-admin-password');
+    if (el) el.textContent = 'Password is required.';
+    valid = false;
+  }
+  if (!valid) return;
+  setBusy(submit, true, 'Verifying access...'); spinner.hidden = false;
   try {
-    const result = await api('/auth/login', {method: 'POST', body: JSON.stringify(Object.fromEntries(new FormData(event.currentTarget)))});
+    const result = await api('/auth/login', {method: 'POST', body: JSON.stringify(data)});
     token = result.access_token; sessionStorage.agentToken = token; await boot();
   } catch (error) { $('#login-error').textContent = error.message; }
   finally { setBusy(submit, false); spinner.hidden = true; }
@@ -258,24 +291,133 @@ const customerApi = async (path, options = {}) => {
   if (!response.ok) throw new Error(data.message || data.error || 'Request failed');
   return data;
 };
+function clearCustomerAuthErrors() {
+  const regForm = $('#customer-register-form');
+  const loginForm = $('#customer-login-form');
+  [regForm, loginForm].forEach(form => {
+    if (!form) return;
+    form.querySelectorAll('.field-error').forEach(el => { el.textContent = ''; });
+    form.querySelectorAll('[aria-invalid]').forEach(el => { el.setAttribute('aria-invalid', 'false'); });
+  });
+}
 function showCustomerAuth(mode = 'login') {
   document.body.classList.add('customer-auth-active');
   $('#landing').hidden = true; $('#login').hidden = true; $('#app').hidden = true; $('#customer-app').hidden = true; $('#customer-auth').hidden = false;
-  document.querySelectorAll('.auth-mode').forEach(button => button.classList.toggle('active', button.dataset.customerMode === mode));
-  $('#customer-register-form').hidden = mode !== 'register'; $('#customer-login-form').hidden = mode !== 'login';
-  $('#customer-auth-title').textContent = mode === 'register' ? 'Create your secure account.' : 'Welcome back to Black Intel.';
-  $('#customer-auth-copy').textContent = mode === 'register' ? 'Your customer ID is issued once and remains yours.' : 'Use your name, Black Intel customer ID, and password.';
+  document.querySelectorAll('.auth-mode').forEach(button => {
+    const active = button.dataset.customerMode === mode;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  const regForm = $('#customer-register-form');
+  const loginForm = $('#customer-login-form');
+  regForm.hidden = mode !== 'register';
+  loginForm.hidden = mode !== 'login';
+  clearCustomerAuthErrors();
+  $('#customer-auth-title').textContent = mode === 'register' ? 'Create Your Black Intel Account' : 'Sign In to Black Intel';
+  $('#customer-auth-copy').textContent = mode === 'register' ? 'Your customer ID is issued once and remains yours.' : 'Use your registered full name, Black Intel customer ID, and password.';
   $('#customer-auth-error').textContent = '';
+  const activeForm = mode === 'register' ? regForm : loginForm;
+  activeForm?.elements?.full_name?.focus();
+}
+function renderMarkdown(rawText) {
+  if (!rawText || typeof rawText !== 'string') return '';
+  const escapeHtml = str => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const codeBlocks = [];
+  let text = rawText.replace(/```([a-zA-Z0-9_\-\.]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push(`<pre><code class="language-${escapeHtml(lang)}">${escapeHtml(code.trim())}</code></pre>`);
+    return `@@CODE_BLOCK_${idx}@@`;
+  });
+  const inlineCodes = [];
+  text = text.replace(/`([^`\n]+)`/g, (_, code) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
+    return `@@INLINE_CODE_${idx}@@`;
+  });
+  text = escapeHtml(text);
+  text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/__(.+?)__/g, '<strong>$1</strong>');
+  const lines = text.split('\n');
+  const processed = [];
+  let inUl = false;
+  let inOl = false;
+  for (let line of lines) {
+    const headingMatch = line.match(/^(\s*)(#{1,4})\s+(.+)$/);
+    if (headingMatch) {
+      if (inUl) { processed.push('</ul>'); inUl = false; }
+      if (inOl) { processed.push('</ol>'); inOl = false; }
+      const level = Math.min(headingMatch[2].length + 1, 4);
+      processed.push(`<h${level} class="md-heading">${headingMatch[3]}</h${level}>`);
+      continue;
+    }
+    const ulMatch = line.match(/^(\s*)[-*]\s+(.+)$/);
+    const olMatch = line.match(/^(\s*)\d+\.\s+(.+)$/);
+    if (ulMatch) {
+      if (inOl) { processed.push('</ol>'); inOl = false; }
+      if (!inUl) { processed.push('<ul>'); inUl = true; }
+      processed.push(`<li>${ulMatch[2]}</li>`);
+    } else if (olMatch) {
+      if (inUl) { processed.push('</ul>'); inUl = false; }
+      if (!inOl) { processed.push('<ol>'); inOl = true; }
+      processed.push(`<li>${olMatch[2]}</li>`);
+    } else {
+      if (inUl) { processed.push('</ul>'); inUl = false; }
+      if (inOl) { processed.push('</ol>'); inOl = false; }
+      processed.push(line);
+    }
+  }
+  if (inUl) processed.push('</ul>');
+  if (inOl) processed.push('</ol>');
+  text = processed.join('\n');
+  inlineCodes.forEach((html, idx) => { text = text.replace(`@@INLINE_CODE_${idx}@@`, html); });
+  codeBlocks.forEach((html, idx) => { text = text.replace(`@@CODE_BLOCK_${idx}@@`, html); });
+  return text;
 }
 function customerMessage(text, role = 'assistant') {
-  const node = document.createElement('p'); node.className = `${role}-message`; node.textContent = text; $('#customer-messages').append(node); $('#customer-messages').scrollTop = $('#customer-messages').scrollHeight;
+  const node = document.createElement('div');
+  node.className = `${role}-message`;
+  if (role === 'assistant') {
+    node.innerHTML = renderMarkdown(text);
+  } else {
+    node.textContent = text;
+  }
+  $('#customer-messages').append(node);
+  $('#customer-messages').scrollTop = $('#customer-messages').scrollHeight;
 }
 function renderCustomerHistory(data) {
   const conversations = data.conversations || []; const appointments = data.appointments || [];
   $('#customer-history-list').innerHTML = `${appointments.length ? appointments.map(item => `<article class="history-item"><span class="history-type">Appointment</span><strong>${esc(dateTime(item.start_at, item.timezone || customerTimeZone))}</strong><small>${esc(item.status)}</small>${item.status !== 'cancelled' ? `<span class="history-actions"><button class="history-control customer-reschedule" data-id="${item._id}" type="button">Reschedule</button><button class="history-control danger customer-cancel" data-id="${item._id}" type="button">Cancel</button></span>` : ''}</article>`).join('') : '<p class="history-empty">No appointments yet.</p>'}${conversations.length ? conversations.map(item => `<article class="history-item"><span class="history-type">Conversation</span><strong>${esc(dateTime(item.updated_at, customerTimeZone))}</strong><button class="history-control customer-conversation" data-id="${item._id}" type="button">Open conversation</button></article>`).join('') : '<p class="history-empty">No conversations yet.</p>'}`;
   document.querySelectorAll('.customer-conversation').forEach(button => button.onclick = () => loadCustomerConversation(button.dataset.id));
-  document.querySelectorAll('.customer-cancel').forEach(button => button.onclick = async () => { try { await customerApi('/appointments/' + button.dataset.id + '/cancel', {method: 'POST'}); $('#customer-booking-message').textContent = 'Appointment cancelled.'; await loadCustomerDashboard(); } catch (error) { $('#customer-booking-message').textContent = error.message; } });
-  document.querySelectorAll('.customer-reschedule').forEach(button => button.onclick = () => { customerRescheduleAppointmentId = button.dataset.id; $('#customer-booking-message').textContent = 'Choose a new date and time, then confirm your reschedule.'; $('#customer-booking-form').elements.date.focus(); });
+  document.querySelectorAll('.customer-cancel').forEach(button => button.onclick = async () => { try { await customerApi('/appointments/' + button.dataset.id + '/cancel', {method: 'POST'}); $('#customer-booking-message').textContent = 'Appointment cancelled.'; $('#customer-booking-message').style.color = 'var(--accent)'; await loadCustomerDashboard(); } catch (error) { $('#customer-booking-message').style.color = 'var(--danger)'; $('#customer-booking-message').textContent = error.message; } });
+  document.querySelectorAll('.customer-reschedule').forEach(button => button.onclick = () => {
+    customerRescheduleAppointmentId = button.dataset.id;
+    const form = $('#customer-booking-form');
+    const feedback = $('#customer-booking-message');
+    feedback.style.color = 'var(--accent)';
+    feedback.textContent = 'Choose a new date and time above, then click Confirm reschedule.';
+    const submitBtn = form.querySelector('button[type="submit"]');
+    submitBtn.textContent = 'Confirm reschedule';
+    submitBtn.dataset.label = 'Confirm reschedule';
+    let cancelBtn = $('#customer-cancel-reschedule');
+    if (!cancelBtn) {
+      cancelBtn = document.createElement('button');
+      cancelBtn.id = 'customer-cancel-reschedule';
+      cancelBtn.className = 'button button-quiet';
+      cancelBtn.type = 'button';
+      cancelBtn.textContent = 'Cancel reschedule';
+      cancelBtn.onclick = () => {
+        customerRescheduleAppointmentId = null;
+        submitBtn.textContent = 'Check and confirm appointment';
+        submitBtn.dataset.label = 'Check and confirm appointment';
+        cancelBtn.remove();
+        feedback.textContent = '';
+        checkCustomerRequestedTime();
+      };
+      form.append(cancelBtn);
+    }
+    form.elements.date.focus();
+    checkCustomerRequestedTime();
+  });
 }
 async function loadCustomerConversation(conversationId) {
   try { const conversation = await customerApi('/conversations/' + conversationId); customerConversationId = conversation._id; $('#customer-messages').innerHTML = ''; conversation.messages.forEach(message => customerMessage(message.content, message.role === 'customer' ? 'customer' : 'assistant')); } catch (error) { $('#customer-booking-message').textContent = error.message; }
@@ -285,8 +427,9 @@ async function prepareCustomerBookingDate() {
   const input = form.elements.date;
   const min = calendarDateInZone(new Date(), customerTimeZone);
   input.min = min;
-  if (!input.value || input.value < min) input.value = min;
+  if (!input.value || input.value < min) input.value = nextOpenCalendarDate(customerTimeZone);
   if (!form.elements.time.value) form.elements.time.value = '09:00';
+  await checkCustomerRequestedTime();
 }
 async function checkCustomerRequestedTime() {
   const form = $('#customer-booking-form');
@@ -303,8 +446,10 @@ async function checkCustomerRequestedTime() {
     const result = await customerApi(path);
     if (result.timezone) customerTimeZone = result.timezone;
     feedback.textContent = result.message;
+    feedback.style.color = result.available ? 'var(--accent)' : 'var(--danger)';
     return Boolean(result.available);
   } catch (error) {
+    feedback.style.color = 'var(--danger)';
     feedback.textContent = error.message;
     return false;
   }
@@ -320,17 +465,126 @@ async function bootCustomer() {
   try { await customerApi('/me'); document.body.classList.remove('customer-auth-active'); $('#landing').hidden = true; $('#login').hidden = true; $('#app').hidden = true; $('#customer-auth').hidden = true; $('#customer-app').hidden = false; await loadCustomerDashboard(); }
   catch { sessionStorage.removeItem('customerToken'); customerToken = ''; showCustomerAuth('login'); }
 }
+function validateCustomerField(input) {
+  if (!input || !input.name) return true;
+  const name = input.name;
+  const val = (input.value || '').trim();
+  const form = input.form;
+  const isRegister = form && form.id === 'customer-register-form';
+  const prefix = isRegister ? 'err-reg-' : 'err-login-';
+  const errId = prefix + name.replace(/_/g, '-');
+  const errEl = document.getElementById(errId);
+  let message = '';
+
+  if (input.required && !val) {
+    message = 'This field is required.';
+  } else if (name === 'full_name' && val.length < 2) {
+    message = 'Full name must be at least 2 characters.';
+  } else if (name === 'age') {
+    const num = parseInt(val, 10);
+    if (isNaN(num) || num < 13 || num > 120) {
+      message = 'Age must be between 13 and 120.';
+    }
+  } else if (name === 'reason' && val.length < 2) {
+    message = 'Please describe what you would like help with.';
+  } else if (name === 'customer_id' && !/^BI-\d{6,}$/.test(val)) {
+    message = 'Customer ID format should be e.g. BI-000001.';
+  } else if (name === 'password' && val.length < 8) {
+    message = 'Password must be at least 8 characters.';
+  } else if (name === 'confirm_password') {
+    const pwd = form?.elements?.password?.value || '';
+    if (input.value !== pwd) {
+      message = 'Passwords do not match.';
+    }
+  }
+
+  if (errEl) errEl.textContent = message;
+  input.setAttribute('aria-invalid', message ? 'true' : 'false');
+  return !message;
+}
+
+function initCustomerAuthValidation() {
+  const regForm = $('#customer-register-form');
+  const loginForm = $('#customer-login-form');
+  [regForm, loginForm].forEach(form => {
+    if (!form) return;
+    Array.from(form.elements).forEach(el => {
+      if (!['INPUT', 'TEXTAREA'].includes(el.tagName)) return;
+      el.addEventListener('input', () => {
+        validateCustomerField(el);
+        if (el.name === 'password' && form.elements.confirm_password && form.elements.confirm_password.value) {
+          validateCustomerField(form.elements.confirm_password);
+        }
+      });
+      el.addEventListener('blur', () => validateCustomerField(el));
+    });
+  });
+}
+
 async function customerAuthenticate(event, endpoint) {
-  event.preventDefault(); const form = event.currentTarget; const button = form.querySelector('button[type="submit"]'); setBusy(button, true, 'Please wait...'); $('#customer-auth-error').textContent = '';
-  try { const result = await customerApi(endpoint, {method: 'POST', body: JSON.stringify({...Object.fromEntries(new FormData(form)), widget_key: customerWidgetKey})}); customerToken = result.access_token; sessionStorage.customerToken = customerToken; await bootCustomer(); }
-  catch (error) { $('#customer-auth-error').textContent = error.message; }
-  finally { setBusy(button, false); }
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  $('#customer-auth-error').textContent = '';
+
+  let isValid = true;
+  let firstInvalid = null;
+  Array.from(form.elements).forEach(el => {
+    if (!['INPUT', 'TEXTAREA'].includes(el.tagName)) return;
+    const ok = validateCustomerField(el);
+    if (!ok) {
+      isValid = false;
+      if (!firstInvalid) firstInvalid = el;
+    }
+  });
+
+  if (!isValid) {
+    if (firstInvalid) firstInvalid.focus();
+    return;
+  }
+
+  const isRegister = form.id === 'customer-register-form';
+  setBusy(button, true, isRegister ? 'Creating secure account...' : 'Opening dashboard...');
+
+  try {
+    const payload = {...Object.fromEntries(new FormData(form)), widget_key: customerWidgetKey};
+    const result = await customerApi(endpoint, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    if (!result || !result.access_token) {
+      throw new Error('Authentication could not be confirmed by the server.');
+    }
+    customerToken = result.access_token;
+    sessionStorage.customerToken = customerToken;
+    await bootCustomer();
+    if (isRegister && result.customer && result.customer.customer_id) {
+      notice('Welcome ' + result.customer.full_name + '! Your Customer ID is ' + result.customer.customer_id + '.');
+    }
+  } catch (error) {
+    const msg = error.message || 'Authentication failed.';
+    $('#customer-auth-error').textContent = msg;
+    const prefix = isRegister ? 'err-reg-' : 'err-login-';
+    if (msg.toLowerCase().includes('passwords do not match')) {
+      const el = form.elements.confirm_password;
+      if (el) { el.setAttribute('aria-invalid', 'true'); const err = document.getElementById(prefix + 'confirm-password'); if (err) err.textContent = msg; }
+    } else if (msg.toLowerCase().includes('password')) {
+      const el = form.elements.password;
+      if (el) { el.setAttribute('aria-invalid', 'true'); const err = document.getElementById(prefix + 'password'); if (err) err.textContent = msg; }
+    } else if (msg.toLowerCase().includes('credentials') || msg.toLowerCase().includes('customer id')) {
+      const el = form.elements.customer_id;
+      if (el) { el.setAttribute('aria-invalid', 'true'); const err = document.getElementById('err-login-customer-id'); if (err) err.textContent = msg; }
+    }
+  } finally {
+    setBusy(button, false);
+  }
 }
 document.querySelectorAll('.open-customer').forEach(button => button.onclick = () => showCustomerAuth(button.dataset.customerMode || 'login'));
 $('#open-admin-login').onclick = showLogin;
 document.querySelectorAll('.auth-mode').forEach(button => button.onclick = () => showCustomerAuth(button.dataset.customerMode));
 $('#customer-register-form').onsubmit = event => customerAuthenticate(event, '/auth/register');
 $('#customer-login-form').onsubmit = event => customerAuthenticate(event, '/auth/login');
+initCustomerAuthValidation();
 async function sendCustomerMessage(message) {
   const normalized = message.trim();
   if (!normalized) return;
@@ -349,8 +603,44 @@ $('#customer-chat-form').onsubmit = async event => { event.preventDefault(); con
 document.querySelectorAll('[data-customer-prompt]').forEach(button => button.onclick = () => sendCustomerMessage(button.dataset.customerPrompt));
 $('#customer-own-question').onclick = () => $('#customer-chat-form').elements.message.focus();
 $('#customer-booking-form').elements.date.onchange = checkCustomerRequestedTime;
+$('#customer-booking-form').elements.date.oninput = checkCustomerRequestedTime;
 $('#customer-booking-form').elements.time.onchange = checkCustomerRequestedTime;
-$('#customer-booking-form').onsubmit = async event => { event.preventDefault(); const form = event.currentTarget; const data = Object.fromEntries(new FormData(form)); const feedback = $('#customer-booking-message'); if (!data.date || !data.time) return; if (!await checkCustomerRequestedTime()) return; feedback.textContent = 'Confirming your requested time...'; try { const path = customerRescheduleAppointmentId ? '/appointments/' + customerRescheduleAppointmentId + '/reschedule' : '/appointments'; await customerApi(path, {method: 'POST', body: JSON.stringify(data)}); feedback.textContent = customerRescheduleAppointmentId ? 'Appointment rescheduled.' : 'Appointment confirmed.'; customerRescheduleAppointmentId = null; form.elements.time.value = ''; await loadCustomerDashboard(); } catch (error) { feedback.textContent = error.message; } };
+$('#customer-booking-form').elements.time.oninput = checkCustomerRequestedTime;
+$('#customer-booking-form').onsubmit = async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submitButton = form.querySelector('button[type="submit"]');
+  const data = Object.fromEntries(new FormData(form));
+  const feedback = $('#customer-booking-message');
+  if (!data.date || !data.time) return;
+  setBusy(submitButton, true, customerRescheduleAppointmentId ? 'Rescheduling...' : 'Checking availability...');
+  try {
+    const isAvailable = await checkCustomerRequestedTime();
+    if (!isAvailable) {
+      setBusy(submitButton, false);
+      return;
+    }
+    feedback.style.color = 'var(--accent)';
+    feedback.textContent = customerRescheduleAppointmentId ? 'Rescheduling meeting...' : 'Confirming your requested time...';
+    const path = customerRescheduleAppointmentId ? '/appointments/' + customerRescheduleAppointmentId + '/reschedule' : '/appointments';
+    const result = await customerApi(path, {method: 'POST', body: JSON.stringify(data)});
+    if (!result || !result.appointment || !result.appointment._id) {
+      throw new Error('Appointment confirmation was not acknowledged by the server.');
+    }
+    feedback.textContent = customerRescheduleAppointmentId ? 'Appointment successfully rescheduled.' : 'Appointment confirmed.';
+    customerRescheduleAppointmentId = null;
+    submitButton.textContent = 'Check and confirm appointment';
+    submitButton.dataset.label = 'Check and confirm appointment';
+    $('#customer-cancel-reschedule')?.remove();
+    form.elements.time.value = '09:00';
+    await loadCustomerDashboard();
+  } catch (error) {
+    feedback.style.color = 'var(--danger)';
+    feedback.textContent = error.message;
+  } finally {
+    setBusy(submitButton, false);
+  }
+};
 $('#customer-refresh').onclick = loadCustomerDashboard;
 $('#customer-sign-out').onclick = () => { sessionStorage.removeItem('customerToken'); customerToken = ''; showLanding(); };
 if (token) boot(); else if (customerToken) bootCustomer(); else showCustomerAuth('login');

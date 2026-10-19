@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class CustomerRegistrationRequest(BaseModel):
@@ -6,6 +6,7 @@ class CustomerRegistrationRequest(BaseModel):
     age: int = Field(ge=13, le=120)
     reason: str = Field(min_length=2, max_length=1000)
     password: str = Field(min_length=8, max_length=128)
+    confirm_password: str | None = Field(default=None, min_length=8, max_length=128)
     widget_key: str = Field(min_length=12, max_length=256)
 
     @field_validator("full_name", "reason")
@@ -15,6 +16,12 @@ class CustomerRegistrationRequest(BaseModel):
         if not value:
             raise ValueError("This field cannot be empty.")
         return value
+
+    @model_validator(mode="after")
+    def check_passwords_match(self):
+        if self.confirm_password is not None and self.confirm_password != self.password:
+            raise ValueError("Passwords do not match.")
+        return self
 
 
 class CustomerLoginRequest(BaseModel):
