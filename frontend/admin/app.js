@@ -601,9 +601,18 @@ document.querySelectorAll('.auth-mode').forEach(button => button.onclick = () =>
 $('#customer-register-form').onsubmit = event => customerAuthenticate(event, '/auth/register');
 $('#customer-login-form').onsubmit = event => customerAuthenticate(event, '/auth/login');
 initCustomerAuthValidation();
+let isSendingCustomer = false;
 async function sendCustomerMessage(message) {
-  const normalized = message.trim();
+  if (isSendingCustomer) return;
+  const normalized = (message || '').trim();
   if (!normalized) return;
+
+  isSendingCustomer = true;
+  const suggestionBtns = document.querySelectorAll('.customer-suggestions button');
+  suggestionBtns.forEach(b => b.disabled = true);
+  const composerBtn = $('#customer-chat-form button[type="submit"]');
+  if (composerBtn) composerBtn.disabled = true;
+
   customerMessage(normalized, 'customer');
   try {
     const endpoint = customerConversationId ? '/conversations/' + customerConversationId + '/messages' : '/chat';
@@ -613,10 +622,30 @@ async function sendCustomerMessage(message) {
     await loadCustomerDashboard();
   } catch (error) {
     customerMessage(error.message, 'assistant');
+  } finally {
+    isSendingCustomer = false;
+    suggestionBtns.forEach(b => b.disabled = false);
+    if (composerBtn) composerBtn.disabled = false;
   }
 }
-$('#customer-chat-form').onsubmit = async event => { event.preventDefault(); const input = event.currentTarget.elements.message; const message = input.value; input.value = ''; await sendCustomerMessage(message); };
-document.querySelectorAll('[data-customer-prompt]').forEach(button => button.onclick = () => sendCustomerMessage(button.dataset.customerPrompt));
+$('#customer-chat-form').onsubmit = async event => {
+  event.preventDefault();
+  if (isSendingCustomer) return;
+  const input = event.currentTarget.elements.message;
+  const message = input.value;
+  input.value = '';
+  await sendCustomerMessage(message);
+};
+document.querySelectorAll('[data-customer-prompt]').forEach(button => {
+  button.onclick = async event => {
+    event.preventDefault();
+    if (isSendingCustomer) return;
+    const prompt = button.getAttribute('data-customer-prompt') || button.dataset.customerPrompt || button.textContent.trim();
+    const input = $('#customer-chat-form')?.elements?.message;
+    if (input) input.value = '';
+    await sendCustomerMessage(prompt);
+  };
+});
 $('#customer-own-question').onclick = () => $('#customer-chat-form').elements.message.focus();
 $('#customer-booking-form').elements.date.onchange = checkCustomerRequestedTime;
 $('#customer-booking-form').elements.date.oninput = checkCustomerRequestedTime;
@@ -660,11 +689,19 @@ $('#customer-booking-form').onsubmit = async event => {
 $('#customer-refresh').onclick = loadCustomerDashboard;
 $('#customer-sign-out').onclick = () => { sessionStorage.removeItem('customerToken'); customerToken = ''; showLanding(); };
 
+let isSendingPublic = false;
 async function sendPublicMessage(message) {
+  if (isSendingPublic) return;
   const normalized = (message || '').trim();
   if (!normalized) return;
   const messagesContainer = $('#public-chat-messages');
   if (!messagesContainer) return;
+
+  isSendingPublic = true;
+  const chips = document.querySelectorAll('.public-chat-suggestions .chip');
+  chips.forEach(b => b.disabled = true);
+  const composerBtn = $('#public-chat-form button[type="submit"]');
+  if (composerBtn) composerBtn.disabled = true;
 
   const userNode = document.createElement('div');
   userNode.className = 'preview-message user';
@@ -699,6 +736,9 @@ async function sendPublicMessage(message) {
     typingNode.className = 'preview-message agent';
     typingNode.innerHTML = `<b>Black Intel Agent</b><br><span style="color:var(--danger)">${esc(err.message)}</span>`;
   } finally {
+    isSendingPublic = false;
+    chips.forEach(b => b.disabled = false);
+    if (composerBtn) composerBtn.disabled = false;
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
   }
 }
@@ -707,6 +747,7 @@ const publicChatForm = $('#public-chat-form');
 if (publicChatForm) {
   publicChatForm.onsubmit = async event => {
     event.preventDefault();
+    if (isSendingPublic) return;
     const input = $('#public-chat-input');
     const msg = input.value;
     input.value = '';
@@ -714,7 +755,14 @@ if (publicChatForm) {
   };
 }
 document.querySelectorAll('[data-public-prompt]').forEach(button => {
-  button.onclick = () => sendPublicMessage(button.dataset.publicPrompt);
+  button.onclick = async event => {
+    event.preventDefault();
+    if (isSendingPublic) return;
+    const prompt = button.getAttribute('data-public-prompt') || button.dataset.publicPrompt || button.textContent.trim();
+    const input = $('#public-chat-input');
+    if (input) input.value = '';
+    await sendPublicMessage(prompt);
+  };
 });
 
 function initPublicBookingDate() {

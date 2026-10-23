@@ -51,8 +51,11 @@ def require_widget(view):
                 return jsonify({"error": "invalid_widget", "message": "Widget access is not available."}), 401
         else:
             # Safely resolve server-configured Black Intel primary tenant for first-party public site
-            bi_tenant = db.tenants.find_one({"slug": "black-intel-demo"}) or db.tenants.find_one(
-                {"name": {"$regex": "Black Intel", "$options": "i"}}
+            bi_tenant = (
+                db.tenants.find_one({"slug": "black-intel-demo"})
+                or db.tenants.find_one({"name": {"$regex": "Black Intel", "$options": "i"}})
+                or db.tenants.find_one({"status": "active"})
+                or db.tenants.find_one()
             )
             if bi_tenant:
                 config = db.widget_configs.find_one({"tenant_id": bi_tenant["_id"], "enabled": {"$ne": False}}) or {
@@ -120,9 +123,19 @@ def send_message(conversation_id=None):
     else:
         conversation = {"tenant_id": g.widget["tenant_id"], "visitor_id": str(payload.get("visitor_id") or secrets.token_urlsafe(16)), "channel": "widget", "status": "open", "created_at": now(), "updated_at": now()}
         conversation["_id"] = db.conversations.insert_one(conversation).inserted_id
-    db.messages.insert_one({"tenant_id": g.widget["tenant_id"], "conversation_id": conversation["_id"], "role": "visitor", "content": message.strip(), "created_at": now()})
+    from app.services.llm_gateway import _detect_introduced_name, _canonicalize_query
+    clean_message = _canonicalize_query(message.strip())
+    db.messages.insert_one({"tenant_id": g.widget["tenant_id"], "conversation_id": conversation["_id"], "role": "visitor", "content": clean_message, "created_at": now()})
     history = list(db.messages.find({"tenant_id": g.widget["tenant_id"], "conversation_id": conversation["_id"]}).sort("created_at", -1).limit(8))
-    answer = respond(tenant_id, message.strip(), list(reversed(history)))
+
+    # Guest personalization: detect introduced name and remember within conversation
+    guest_name = conversation.get("guest_name")
+    detected = _detect_introduced_name(clean_message)
+    if detected:
+        guest_name = detected
+        db.conversations.update_one({"_id": conversation["_id"]}, {"$set": {"guest_name": guest_name}})
+
+    answer = respond(tenant_id, clean_message, list(reversed(history)), customer_name=guest_name)
     db.messages.insert_one({"tenant_id": g.widget["tenant_id"], "conversation_id": conversation["_id"], "role": "agent", "content": answer["answer"], "citations": answer["citations"], "created_at": now()})
     db.conversations.update_one({"_id": conversation["_id"]}, {"$set": {"updated_at": now()}})
     return jsonify({"conversation_id": str(conversation["_id"]), **answer})

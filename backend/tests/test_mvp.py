@@ -941,7 +941,7 @@ def test_ai_provider_gemini_mocked_completion(app_client, monkeypatch):
     client.application.config.update({
         "LLM_PROVIDER": "gemini",
         "GEMINI_API_KEY": "test-gemini-key",
-        "GEMINI_MODEL": "gemini-2.0-flash",
+        "GEMINI_MODEL": "gemini-3.8-flash",
     })
 
     mock_response_payload = {
@@ -1085,8 +1085,8 @@ def test_tenant_isolation_in_ai_system_prompt(app_client, monkeypatch):
 
     res1 = client.post("/api/v1/chat", headers={"X-Widget-Key": "tenant-one-key"}, json={"message": "What is Quantum Shielding?"})
     assert res1.status_code == 200
-    assert captured_payloads
-    prompt1 = captured_payloads[0]["system_instruction"]["parts"][0]["text"]
+    si = captured_payloads[0]["system_instruction"]
+    prompt1 = si["parts"][0]["text"] if isinstance(si, dict) else si
     assert "Tenant One" in prompt1
     assert "Quantum Shielding" in prompt1
     assert "Tenant Two" not in prompt1
@@ -1861,13 +1861,13 @@ def test_contact_fallback_uses_verified_email_and_preserves_tenant_isolation(app
             "tenant_id": bi_no_email_id,
             "name": "Black Intel",
         })
-        res_b = respond(str(bi_no_email_id), "py code do")
+        res_b = respond(str(bi_no_email_id), "What is the return and refund policy?")
         assert "abhishek.managerr@gmail.com" in res_b["answer"]
         assert "admin@blackintel.com" not in res_b["answer"]
 
         # Case C: Custom tenant with its own verified contact email
         tenant_one_id = str(tenants[0][1])
-        res_c = respond(tenant_one_id, "wt ky hots ha")
+        res_c = respond(tenant_one_id, "What is the return and refund policy?")
         assert "tenant-one@example.com" in res_c["answer"]
         assert "abhishek.managerr@gmail.com" not in res_c["answer"], "Must not leak Black Intel contact to Tenant One"
         assert "admin@blackintel.com" not in res_c["answer"]
@@ -1965,7 +1965,9 @@ def test_public_chat_general_technical_query_gives_honest_diagnostic_fallback(ap
     with client.application.app_context():
         res = respond(str(bi_tenant_id), "Write a Python program to add two numbers.")
         answer = res["answer"]
-        assert "generative AI provider" in answer or "offline" in answer or "configured" in answer
+        assert res["provider"] == "local"
+        assert "def add_numbers(" in answer or "def " in answer
+        assert "External AI completion is currently unavailable" not in answer
         assert "abhishek.managerr@gmail.com" not in answer, "Must not tell visitors to email Abhishek for Python code"
 
 
@@ -2100,3 +2102,860 @@ def test_public_website_landing_page_renders_chat_and_booking(app_client):
     assert 'id="public-booking-form"' in html
     assert 'id="consultation"' in html
     assert 'Black Intel AI Assistant' in html
+
+
+def test_gemini_model_selection_and_resolution():
+    """
+    Test Gemini model selection:
+    - Defaults to gemini-3.8-flash for empty, None, shut-down, or unknown models.
+    - Preserves explicitly valid models from the whitelist.
+    - Handles models/ prefix cleanly.
+    """
+    from app.services.ai_provider import resolve_gemini_model, DEFAULT_GEMINI_MODEL
+
+    assert resolve_gemini_model(None) == DEFAULT_GEMINI_MODEL
+    assert resolve_gemini_model("") == DEFAULT_GEMINI_MODEL
+    assert resolve_gemini_model("   ") == DEFAULT_GEMINI_MODEL
+    assert resolve_gemini_model("gemini-2.0-flash") == DEFAULT_GEMINI_MODEL
+    assert resolve_gemini_model("gemini-3-flash-preview") == DEFAULT_GEMINI_MODEL
+    assert resolve_gemini_model("unsupported-model-v99") == DEFAULT_GEMINI_MODEL
+
+    # Explicitly supported models
+    assert resolve_gemini_model("gemini-3.8-flash") == "gemini-3.8-flash"
+    assert resolve_gemini_model("gemini-2.5-flash") == "gemini-2.5-flash"
+    assert resolve_gemini_model("gemini-2.5-pro") == "gemini-2.5-pro"
+    assert resolve_gemini_model("models/gemini-3.8-flash") == "gemini-3.8-flash"
+
+    # Removed unverified or restricted legacy models fall back to default
+    assert resolve_gemini_model("gemini-3.8-pro") == DEFAULT_GEMINI_MODEL
+    assert resolve_gemini_model("gemini-1.5-flash") == DEFAULT_GEMINI_MODEL
+    assert resolve_gemini_model("gemini-1.5-pro") == DEFAULT_GEMINI_MODEL
+
+
+def test_gemini_404_fallback_to_default_model_and_not_2_0_flash(monkeypatch):
+    """
+    When an explicitly requested model returns 404, call_gemini retries once with
+    DEFAULT_GEMINI_MODEL (gemini-3.8-flash) and never uses the shut-down gemini-2.0-flash.
+    If default model itself returns 404, it raises RuntimeError without infinite recursion.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+    from app.services.ai_provider import call_gemini, DEFAULT_GEMINI_MODEL
+
+    called_urls = []
+    called_models = []
+
+    class MockSuccessResponse:
+        status = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self):
+            return b'{"outputs": [{"type": "model_output", "content": [{"type": "text", "text": "Success answer"}]}]}'
+
+    def mock_urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        called_urls.append(url)
+        data = json.loads(req.data.decode("utf-8")) if hasattr(req, "data") and req.data else {}
+        m = data.get("model", "")
+        called_models.append(m)
+        if m == "gemini-2.5-flash":
+            # First attempt with non-default model returns 404
+            raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+        # Fallback attempt with gemini-3.8-flash succeeds
+        return MockSuccessResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    res = call_gemini(
+        api_key="AIzaSyMockKeyForTesting12345",
+        model="gemini-2.5-flash",
+        system_prompt="system",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    assert res == "Success answer"
+    assert len(called_models) == 2
+    assert called_models[0] == "gemini-2.5-flash"
+    assert called_models[1] == "gemini-3.8-flash"
+    assert "gemini-2.0-flash" not in called_models
+
+    # Test when default model itself returns 404 -> raises RuntimeError without infinite loop
+    called_urls.clear()
+    called_models.clear()
+    def mock_urlopen_all_404(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        called_urls.append(url)
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen_all_404)
+    with pytest.raises(RuntimeError) as exc_info:
+        call_gemini(
+            api_key="AIzaSyMockKeyForTesting12345",
+            model=DEFAULT_GEMINI_MODEL,
+            system_prompt="system",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+    assert "404" in str(exc_info.value)
+    assert len(called_urls) == 1, "Must not retry when DEFAULT_GEMINI_MODEL itself returns 404"
+
+
+def test_gemini_authentication_and_key_handling(app_client):
+    """
+    Test candidate API key validation and error handling:
+    - Candidate keys from Google AI Studio (AQ.Ab8..., AIzaSy...) are accepted structurally.
+    - Empty, missing, and short keys raise ValueError.
+    - generate_ai_completion returns honest failure on missing key.
+    - respond() falls back honestly to local mode without claiming AI completion.
+    """
+    from app.services.ai_provider import validate_gemini_api_key, is_valid_gemini_api_key, generate_ai_completion
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    # 1. Structural validation accepts candidate keys from AI Studio
+    for valid_key in ("AQ.Ab8ValidAIStudioKeyFormat12345", "AIzaSyDummyValidGoogleAIStudioKey123"):
+        assert is_valid_gemini_api_key(valid_key)
+        assert validate_gemini_api_key(valid_key) == valid_key
+
+    # 2. Rejects empty, missing, or too short keys
+    for bad_key in ("", "   ", None, "short"):
+        assert not is_valid_gemini_api_key(bad_key)
+        with pytest.raises(ValueError):
+            validate_gemini_api_key(bad_key)
+
+    # 3. generate_ai_completion with empty key returns honest failure
+    client.application.config.update({
+        "LLM_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "",
+    })
+    with client.application.app_context():
+        text, provider, err = generate_ai_completion("system", [{"role": "user", "content": "hello"}])
+        assert text is None
+
+        # 4. respond() falls back to local and never reports provider: gemini
+        res = respond(tenant_id, "Write a Python program to sort a list")
+        assert res["provider"] == "local"
+        assert "External AI completion is currently unavailable" not in res["answer"]
+        assert "def " in res["answer"] or "sort" in res["answer"].lower()
+
+
+def test_gemini_http_auth_and_rate_limit_errors(app_client, monkeypatch):
+    """
+    Test honest handling of Google API HTTP error responses:
+    - HTTP 401/403: reports credential/authentication error
+    - HTTP 429: reports rate limit error
+    - Timeout: reports timeout error
+    In all cases, respond() falls back to local provider and never fakes an AI response.
+    """
+    import urllib.error
+    import urllib.request
+    from app.services.llm_gateway import respond
+    from app.services.ai_provider import call_gemini
+
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    # Test HTTP 401 handling in call_gemini
+    def mock_401(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_401)
+    with pytest.raises(RuntimeError) as exc_info:
+        call_gemini("AIzaSyValidKeyFormatMock123456", "gemini-3.8-flash", "sys", [{"role": "user", "content": "hi"}])
+    assert "authentication/credential error" in str(exc_info.value)
+
+    # Test HTTP 429 handling in call_gemini
+    def mock_429(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_429)
+    with pytest.raises(RuntimeError) as exc_info:
+        call_gemini("AIzaSyValidKeyFormatMock123456", "gemini-3.8-flash", "sys", [{"role": "user", "content": "hi"}])
+    assert "rate limit exceeded" in str(exc_info.value)
+
+    # Test respond() fallback when HTTP 429 happens
+    client.application.config.update({
+        "LLM_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "AIzaSyValidKeyFormatMock123456",
+        "GEMINI_MODEL": "gemini-3.8-flash",
+    })
+    with client.application.app_context():
+        res = respond(tenant_id, "Explain quantum computing in Python")
+        assert res["provider"] == "local"
+        assert "External AI completion is currently unavailable" not in res["answer"]
+        assert len(res["answer"]) > 10
+
+
+def test_programming_and_general_queries_fallback_behavior(app_client):
+    """
+    Verify that:
+    1. Programming and code queries (like 'py code do', 'write a python function')
+       never send the user to the Black Intel contact email fallback.
+       They clearly disclose that external AI completion is unavailable.
+    2. Unknown general queries (like 'wt ky hots ha') do not leak contact emails or invent company facts.
+    """
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    with client.application.app_context():
+        # A. Programming query: 'py code do'
+        res_code = respond(tenant_id, "py code do")
+        assert res_code["provider"] == "local"
+        assert "External AI completion is currently unavailable" not in res_code["answer"]
+        assert "python" in res_code["answer"].lower()
+        assert "abhishek.managerr@gmail.com" not in res_code["answer"], "Programming questions must never return contact email"
+        assert "admin@blackintel.com" not in res_code["answer"]
+
+        # B. Python function query
+        res_py = respond(tenant_id, "how to write a loop in python")
+        assert res_py["provider"] == "local"
+        assert "External AI completion is currently unavailable" not in res_py["answer"]
+        assert "loop" in res_py["answer"].lower() or "for " in res_py["answer"]
+        assert "abhishek.managerr@gmail.com" not in res_py["answer"]
+
+        # C. General unknown/slang query
+        res_slang = respond(tenant_id, "wt ky hots ha")
+        assert res_slang["provider"] == "local"
+        assert "abhishek.managerr@gmail.com" not in res_slang["answer"]
+        assert "admin@blackintel.com" not in res_slang["answer"]
+
+
+def test_general_ai_programming_code_generation_with_gemini(app_client, monkeypatch):
+    """
+    Verify that when Gemini is configured and enabled:
+    1. Asking a programming question ('py code do') generates Python code.
+    2. The response has provider: 'gemini'.
+    3. The response does not contain contact email fallbacks.
+    """
+    import io
+    import json
+    import urllib.request
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    fake_response_data = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "text": "```python\ndef add(a, b):\n    return a + b\n\nprint(add(2, 3))\n```"
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    class MockHTTPResponse:
+        status = 200
+
+        def read(self):
+            return json.dumps(fake_response_data).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    def mock_urlopen(req, timeout=None):
+        return MockHTTPResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    client.application.config.update({
+        "LLM_PROVIDER": "gemini",
+        "GEMINI_API_KEY": "AIzaSyValidGoogleStudioKeyMock12345",
+        "GEMINI_MODEL": "gemini-3.8-flash",
+    })
+
+    with client.application.app_context():
+        res = respond(tenant_id, "py code do")
+        assert res["provider"] == "gemini", "Successful Gemini completion must report provider: gemini"
+        assert "def add(a, b):" in res["answer"], "Must return generated Python code"
+        assert "abhishek.managerr@gmail.com" not in res["answer"]
+        assert "admin@blackintel.com" not in res["answer"]
+
+
+def test_public_anonymous_chat_no_login_required(app_client):
+    """
+    Verify that visitors can access public chat without login,
+    while protected customer and admin APIs strictly require authentication.
+    """
+    client, _ = app_client
+
+    # 1. Anonymous visitor can send chat message to /api/v1/public/chat
+    chat_resp = client.post("/api/v1/public/chat", json={"message": "What services do you provide?"})
+    assert chat_resp.status_code == 200
+    data = chat_resp.get_json()
+    assert "conversation_id" in data
+    assert "answer" in data
+
+    # 2. Anonymous visitor cannot access customer protected routes
+    cust_resp = client.get("/api/v1/customer/dashboard")
+    assert cust_resp.status_code == 401
+
+    # 3. Anonymous visitor cannot access admin protected routes
+    admin_resp = client.get("/api/v1/admin/context")
+    assert admin_resp.status_code == 401
+
+
+def test_appointment_booking_and_conflict_handling_regression(app_client):
+    """
+    Verify appointment booking, availability checks, buffer enforcement,
+    and conflict prevention:
+    - Available slot is confirmed.
+    - Double booking the same slot returns 409 conflict.
+    - Booking does not alter or touch any production data.
+    """
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    # Query availability slots for a Monday in the future
+    future_monday = "2030-01-07"  # 2030-01-07 is a Monday
+    slots_resp = client.get(f"/api/v1/public/availability/slots?date={future_monday}")
+    assert slots_resp.status_code == 200
+    available = slots_resp.get_json().get("slots", [])
+    assert len(available) > 0, "Expected available slots for business day"
+
+    chosen_slot = available[0]
+
+    # First booking succeeds
+    book_resp_1 = client.post("/api/v1/public/appointments", json={
+        "start_at": chosen_slot,
+        "name": "Jane Doe",
+        "email": "jane@example.com",
+        "phone": "+1234567890",
+        "requirement": "Initial Consultation",
+    })
+    assert book_resp_1.status_code == 201
+    appt_1 = book_resp_1.get_json().get("appointment", {})
+    assert appt_1.get("status") == "confirmed"
+    assert "manage_token" in appt_1
+
+    # Second booking for the same slot is rejected with 409 conflict
+    book_resp_2 = client.post("/api/v1/public/appointments", json={
+        "start_at": chosen_slot,
+        "name": "John Smith",
+        "email": "john@example.com",
+        "phone": "+1987654321",
+        "requirement": "Conflict Test",
+    })
+    assert book_resp_2.status_code == 409
+    error_msg = book_resp_2.get_json().get("message", "")
+    assert "no longer available" in error_msg or "conflict" in error_msg.lower()
+
+
+def test_anonymous_guest_name_introduction_and_persistence(app_client):
+    """
+    Verify anonymous guest personalization:
+    - Guest introduces their name in Hindi/Hinglish: 'Mera naam Rahul hai'
+    - Chatbot warmly greets Rahul by name.
+    - Conversation remembers 'Rahul' across follow-up turns.
+    - A different guest conversation remains strictly isolated.
+    """
+    client, _ = app_client
+    key = {"X-Widget-Key": "tenant-one-key"}
+
+    # 1. Guest 1 introduces name in Hinglish
+    intro_resp = client.post("/api/v1/chat", headers=key, json={"message": "Mera naam Rahul hai"})
+    assert intro_resp.status_code == 200
+    data1 = intro_resp.get_json()
+    assert "Rahul" in data1["answer"]
+    assert "Namaste" in data1["answer"] or "swagat" in data1["answer"].lower()
+    conv_id = data1["conversation_id"]
+
+    # 2. Guest 1 sends a follow-up asking for appointment guidance
+    follow_resp = client.post(
+        f"/api/v1/public/conversations/{conv_id}/messages",
+        headers=key,
+        json={"message": "I want to schedule an appointment"},
+    )
+    assert follow_resp.status_code == 200
+    assert "Rahul" in follow_resp.get_json()["answer"]
+    assert "appointment booking form" in follow_resp.get_json()["answer"]
+
+    # 3. Guest 2 starts a new conversation without introducing their name
+    guest2_resp = client.post("/api/v1/chat", headers=key, json={"message": "hello"})
+    assert guest2_resp.status_code == 200
+    # Must NOT address Guest 2 as Rahul
+    assert "Rahul" not in guest2_resp.get_json()["answer"]
+    assert guest2_resp.get_json()["answer"].startswith("Hello. I can help with")
+
+
+def test_official_black_intel_expanded_knowledge_and_chunking(app_client):
+    """
+    Verify expanded official Black Intel company knowledge:
+    - Syncing official records creates 20 verified published records.
+    - Verified retrieval for Cyber Offense, Forensics, Leadership, Booking, and Pricing.
+    - Scalable document chunker works with metadata and deduplication hashing.
+    """
+    from app.services.official_knowledge import (
+        sync_official_knowledge,
+        chunk_document,
+        OFFICIAL_BLACK_INTEL_KNOWLEDGE,
+    )
+    from app.services.knowledge_service import retrieve
+
+    client, _ = app_client
+    db = client.application.extensions["mongo_db"]
+    tenant = db.tenants.find_one({"slug": "tenant-one"})["_id"]
+
+    # 1. Sync official verified records
+    synced_count = sync_official_knowledge(db, tenant)
+    assert synced_count >= 20
+    assert len(OFFICIAL_BLACK_INTEL_KNOWLEDGE) >= 20
+
+    with client.application.app_context():
+        # 2. Cyber Offense Command retrieval
+        offense = retrieve(str(tenant), "Tell me about Cyber Offense and APT simulation")
+        assert offense
+        assert any("offense" in rec["title"].lower() or "penetration" in rec["content"].lower() for rec in offense)
+
+        # 3. Truth Extraction & Forensics retrieval
+        forensics = retrieve(str(tenant), "What is Forensic Truth Extraction?")
+        assert forensics
+        assert any("forensic" in rec["title"].lower() or "truth" in rec["content"].lower() for rec in forensics)
+
+        # 4. Confidentiality & NDA retrieval
+        nda = retrieve(str(tenant), "Do you sign non disclosure agreements?")
+        assert nda
+        assert any("confidentiality" in rec["title"].lower() or "nda" in rec["content"].lower() for rec in nda)
+
+    # 5. Scalable Document Chunker verification
+    long_doc = "Security architecture and forensics analysis. " * 150
+    chunks = chunk_document("Enterprise Threat Model", long_doc, chunk_size=50, overlap=10)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert "Enterprise Threat Model" in chunk["title"]
+        assert "hash" in chunk and len(chunk["hash"]) == 16
+        assert chunk["source_url"] == "https://theblackintel.com/"
+
+
+def test_gemini_free_general_knowledge_and_code_synthesis():
+    """
+    Verify curated general knowledge and Python code synthesis:
+    - Code synthesis produces clean, runnable Python for add_numbers, reverse_string, is_prime.
+    - General knowledge retrieval covers science, mathematics, computer science, and cryptography.
+    """
+    from app.services.general_knowledge import (
+        search_general_knowledge,
+        synthesize_code_response,
+    )
+
+    # 1. Python code synthesis for add_numbers
+    code1 = synthesize_code_response("Write a Python function named add_numbers that takes two arguments and returns their sum.")
+    assert code1 is not None
+    assert "def add_numbers(" in code1
+    assert "return a + b" in code1
+
+    # 2. Python code synthesis for reverse_string
+    code2 = synthesize_code_response("How to reverse a string in Python?")
+    assert code2 is not None
+    assert "[::-1]" in code2
+
+    # 3. General knowledge: Science (Photosynthesis)
+    science = search_general_knowledge("What is photosynthesis in plants?")
+    assert science
+    assert science[0]["topic"] == "Photosynthesis"
+    assert "glucose" in science[0]["content"].lower()
+
+    # 4. General knowledge: Mathematics (Pythagorean Theorem)
+    math_rec = search_general_knowledge("Explain the Pythagorean theorem for triangles")
+    assert math_rec
+    assert math_rec[0]["topic"] == "Pythagorean Theorem"
+    assert "a^2 + b^2 = c^2" in math_rec[0]["content"]
+
+    # 5. General knowledge: Computer Science (SQL vs NoSQL)
+    db_rec = search_general_knowledge("What is the difference between SQL and NoSQL databases?")
+    assert db_rec
+    assert db_rec[0]["topic"] == "SQL vs NoSQL Databases"
+    assert "MongoDB" in db_rec[0]["content"]
+
+
+def test_ollama_local_llm_provider_integration_and_fallback(app_client, monkeypatch):
+    """
+    Verify Ollama local model integration:
+    - When Ollama is available, generate_ai_completion calls call_ollama and returns provider: ollama.
+    - When Ollama server is offline (connection error), it catches the error gracefully and returns None without crashing.
+    """
+    import urllib.request
+    from unittest.mock import MagicMock
+    from app.services.ai_provider import call_ollama, generate_ai_completion
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    # 1. Mock successful Ollama response
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.read.return_value = b'{"message": {"role": "assistant", "content": "Local Ollama generated response."}}'
+    mock_response.__enter__.return_value = mock_response
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: mock_response)
+    text = call_ollama("http://localhost:11434", "qwen2.5:3b", "System", [{"role": "user", "content": "Hello"}])
+    assert text == "Local Ollama generated response."
+
+    # 2. Configure app to use Ollama provider
+    client.application.config["LLM_PROVIDER"] = "ollama"
+    with client.application.app_context():
+        comp_text, prov, err = generate_ai_completion("System prompt", [{"role": "user", "content": "Hello"}])
+        assert comp_text == "Local Ollama generated response."
+        assert prov == "ollama"
+        assert err is None
+
+        # 3. When Ollama is offline, connection failure is caught gracefully
+        import urllib.error
+        def mock_offline(req, timeout=None):
+            raise urllib.error.URLError("Connection refused [Errno 111]")
+
+        monkeypatch.setattr(urllib.request, "urlopen", mock_offline)
+        offline_text, offline_prov, offline_err = generate_ai_completion("Sys", [{"role": "user", "content": "Hello"}])
+        assert offline_text is None
+        assert offline_prov == "ollama"
+        assert "connection error" in offline_err.lower()
+
+        # Gateway falls back to local engine safely
+        res = respond(tenant_id, "Hello")
+        assert res["provider"] == "local"
+        assert "approved services" in res["answer"]
+
+
+def test_isolated_db_mode_activation_and_uri_ignored(monkeypatch):
+    """Verify that enabling isolated in-memory mode ignores remote Atlas URI and uses mongomock."""
+    from unittest.mock import MagicMock
+    import pymongo
+
+    mock_pymongo_client = MagicMock()
+    monkeypatch.setattr(pymongo, "MongoClient", mock_pymongo_client)
+    monkeypatch.setattr("app.MongoClient", mock_pymongo_client)
+
+    remote_fake_uri = "mongodb+srv://mock-user:mock-pass@production-cluster.fake.mongodb.net/prod_db"
+    monkeypatch.setenv("MONGODB_URI", remote_fake_uri)
+    monkeypatch.setenv("ISOLATED_LOCAL_DB", "true")
+
+    app = create_app({
+        "TESTING": True,
+        "SECRET_KEY": "s" * 32,
+        "JWT_SECRET_KEY": "j" * 32,
+        "MONGODB_DATABASE": "isolated_test_db",
+    })
+
+    # PyMongo's network MongoClient must NEVER be called
+    mock_pymongo_client.assert_not_called()
+
+    # Application extensions must be set to isolated mongomock client
+    assert app.extensions["is_isolated_db"] is True
+    assert isinstance(app.extensions["mongo_client"], mongomock.MongoClient)
+    assert app.config["MONGODB_URI"] == "mongomock://localhost/isolated_in_memory"
+
+
+def test_isolated_db_fails_closed_when_mongomock_unavailable(monkeypatch):
+    """Verify fail-closed behavior: when mongomock is missing, isolated mode raises RuntimeError and never falls back to production."""
+    import sys
+    from unittest.mock import patch, MagicMock
+    import pymongo
+
+    mock_pymongo_client = MagicMock()
+    monkeypatch.setattr(pymongo, "MongoClient", mock_pymongo_client)
+    monkeypatch.setattr("app.MongoClient", mock_pymongo_client)
+
+    with patch.dict(sys.modules, {"mongomock": None}):
+        with pytest.raises(RuntimeError) as exc_info:
+            create_app({
+                "ISOLATED_LOCAL_DB": True,
+                "TESTING": True,
+                "SECRET_KEY": "s" * 32,
+                "JWT_SECRET_KEY": "j" * 32,
+            })
+
+        assert "ISOLATED DATABASE MODE FAILED" in str(exc_info.value)
+        assert "mongomock" in str(exc_info.value)
+
+    # Must fail closed: never attempt network call
+    mock_pymongo_client.assert_not_called()
+
+
+def test_isolated_db_normal_routes_and_ephemeral_sessions():
+    """Verify all public, auth, and customer routes function correctly with the isolated in-memory database."""
+    app = create_app({
+        "ISOLATED_LOCAL_DB": True,
+        "SEED_DEMO_DATA": True,
+        "TESTING": True,
+        "SECRET_KEY": "s" * 32,
+        "JWT_SECRET_KEY": "j" * 32,
+        "LLM_PROVIDER": "local",
+    })
+    client = app.test_client()
+
+    # 1. Health check returns 200 with isolated database
+    health_res = client.get("/api/v1/health")
+    assert health_res.status_code == 200
+    assert health_res.get_json()["status"] == "ok"
+
+    # 2. Public widget-config resolves seeded Black Intel demo tenant
+    cfg_res = client.get("/api/v1/public/widget-config")
+    assert cfg_res.status_code == 200
+    assert cfg_res.get_json()["business_name"] == "Black Intel"
+
+    # 3. Public chat resolves grounded knowledge from in-memory DB
+    chat_res = client.post("/api/v1/public/chat", json={
+        "message": "What services does Black Intel offer?",
+    })
+    assert chat_res.status_code == 200
+    chat_json = chat_res.get_json()
+    assert chat_json["provider"] == "local"
+    assert "cybersecurity" in chat_json["answer"].lower()
+
+    # 4. Operator admin login authenticates seeded demo credentials
+    login_res = client.post("/api/v1/auth/login", json={
+        "tenant_slug": "black-intel-demo",
+        "email": "admin@blackintel.com",
+        "password": "ChangeMe123!",
+    })
+    assert login_res.status_code == 200
+    token = login_res.get_json()["access_token"]
+    assert token
+
+    # 5. Customer registration creates ephemeral record in memory
+    reg_res = client.post("/api/v1/customer/auth/register", json={
+        "widget_key": "demo_black_intel_widget_key",
+        "full_name": "Ephemeral Test Customer",
+        "age": 28,
+        "reason": "Test Consultation Inquiry",
+        "password": "CustomerSecure123!",
+        "confirm_password": "CustomerSecure123!",
+    })
+    assert reg_res.status_code == 201
+    cust_data = reg_res.get_json()["customer"]
+    assert cust_data["customer_id"].startswith("BI-")
+
+    # Verify customer was inserted into in-memory collection
+    db = app.extensions["mongo_db"]
+    saved_cust = db.customers.find_one({"customer_id": cust_data["customer_id"]})
+    assert saved_cust is not None
+    assert saved_cust["full_name"] == "Ephemeral Test Customer"
+
+
+def test_isolated_db_env_and_config_flags(monkeypatch):
+    """Verify is_isolated_db_enabled respects various config dict and environment variable flags."""
+    from app.isolated_db import is_isolated_db_enabled
+
+    # Config dict explicit true/false
+    assert is_isolated_db_enabled({"ISOLATED_LOCAL_DB": True}) is True
+    assert is_isolated_db_enabled({"ISOLATED_LOCAL_DB": "1"}) is True
+    assert is_isolated_db_enabled({"ISOLATED_LOCAL_DB": False}) is False
+    assert is_isolated_db_enabled({"ISOLATED_LOCAL_DB": "0"}) is False
+
+    # Environment variables
+    monkeypatch.delenv("ISOLATED_LOCAL_DB", raising=False)
+    monkeypatch.delenv("LOCAL_ISOLATED_DB", raising=False)
+    monkeypatch.delenv("MOCK_DB", raising=False)
+    monkeypatch.delenv("BLACK_INTEL_ISOLATED_DB", raising=False)
+
+    assert is_isolated_db_enabled() is False
+
+    monkeypatch.setenv("LOCAL_ISOLATED_DB", "true")
+    assert is_isolated_db_enabled() is True
+
+    monkeypatch.delenv("LOCAL_ISOLATED_DB")
+    monkeypatch.setenv("MOCK_DB", "yes")
+    assert is_isolated_db_enabled() is True
+
+
+def test_production_mode_preserved_when_isolated_flag_absent(monkeypatch):
+    """Verify standard production database mode is preserved when isolated flag is absent."""
+    from unittest.mock import MagicMock
+    import pymongo
+
+    mock_client_instance = MagicMock()
+    mock_pymongo_client = MagicMock(return_value=mock_client_instance)
+    monkeypatch.setattr(pymongo, "MongoClient", mock_pymongo_client)
+    monkeypatch.setattr("app.MongoClient", mock_pymongo_client)
+    monkeypatch.setattr("app._create_indexes", lambda db: None)
+
+    monkeypatch.delenv("ISOLATED_LOCAL_DB", raising=False)
+    monkeypatch.delenv("LOCAL_ISOLATED_DB", raising=False)
+    monkeypatch.delenv("MOCK_DB", raising=False)
+    monkeypatch.delenv("BLACK_INTEL_ISOLATED_DB", raising=False)
+
+    test_uri = "mongodb://localhost:27017/test_db"
+    app = create_app({
+        "TESTING": True,
+        "SECRET_KEY": "s" * 32,
+        "JWT_SECRET_KEY": "j" * 32,
+        "MONGODB_URI": test_uri,
+        "MONGODB_DATABASE": "test_db",
+    })
+
+    # Production code path calls MongoClient with configured URI
+    mock_pymongo_client.assert_called_once_with(
+        test_uri,
+        serverSelectionTimeoutMS=app.config["MONGODB_SERVER_SELECTION_TIMEOUT_MS"],
+    )
+    assert app.extensions["is_isolated_db"] is False
+
+
+@pytest.fixture()
+def black_intel_client():
+    from app.api.public import _requests
+    from app.api.customer import _auth_requests
+
+    _requests.clear()
+    _auth_requests.clear()
+    app = create_app({
+        "ISOLATED_LOCAL_DB": True,
+        "TESTING": True,
+        "SECRET_KEY": "s" * 32,
+        "JWT_SECRET_KEY": "j" * 32,
+        "SEED_DEMO_DATA": True,
+        "LLM_PROVIDER": "local",
+    })
+    return app.test_client()
+
+
+def test_authenticated_customer_greeting_preserved(black_intel_client):
+    """
+    Verify authenticated account name (e.g. 'jitu') is preserved and addressed:
+    The chatbot saying 'Hello jitu' is correct and verified.
+    """
+    client = black_intel_client
+    reg_res = client.post("/api/v1/customer/auth/register", json={
+        "widget_key": "demo_black_intel_widget_key",
+        "full_name": "jitu",
+        "age": 25,
+        "reason": "Security Assessment",
+        "password": "Password123!",
+        "confirm_password": "Password123!",
+    })
+    assert reg_res.status_code == 201
+    auth_token = reg_res.get_json()["access_token"]
+    assert auth_token
+
+    # Chat as authenticated jitu
+    chat_res = client.post(
+        "/api/v1/customer/chat",
+        headers={"Authorization": f"Bearer {auth_token}"},
+        json={"message": "hello"},
+    )
+    assert chat_res.status_code == 200
+    answer = chat_res.get_json()["answer"]
+    assert "Hello jitu." in answer
+    assert "Black Intel" in answer
+
+
+def test_greetings_and_hinglish_capability_questions(black_intel_client):
+    """
+    Verify:
+    1. Hinglish capability questions ('tum kya kya kar sakte ho?') receive a grounded response
+       outlining the 4 real capabilities: Cybersecurity/Forensics, Consultation Scheduling,
+       Client Workspace Support, General Technical & Programming Reference.
+    2. English capability questions ('what can you do?') receive the same grounded response in English.
+    3. Natural Hinglish greetings ('namaste') receive a polite Hinglish greeting.
+    """
+    client = black_intel_client
+
+    # 1. Hinglish capability query
+    hi_cap = client.post("/api/v1/public/chat", json={"message": "tum kya kya kar sakte ho?"})
+    assert hi_cap.status_code == 200
+    hi_ans = hi_cap.get_json()["answer"]
+    assert "Cybersecurity & Digital Forensics" in hi_ans
+    assert "Consultation Scheduling" in hi_ans
+    assert "Client Workspace" in hi_ans
+    assert "Programming" in hi_ans
+
+    # 2. English capability query
+    en_cap = client.post("/api/v1/public/chat", json={"message": "what can you do?"})
+    assert en_cap.status_code == 200
+    en_ans = en_cap.get_json()["answer"]
+    assert "Cybersecurity & Forensics" in en_ans
+    assert "Consultation Scheduling" in en_ans
+
+    # 3. Hinglish greeting
+    namaste = client.post("/api/v1/public/chat", json={"message": "namaste"})
+    assert namaste.status_code == 200
+    assert "Namaste" in namaste.get_json()["answer"]
+    assert "swagat hai" in namaste.get_json()["answer"]
+
+
+def test_partial_query_canonicalization_and_deduplication(black_intel_client):
+    """
+    Verify:
+    1. Partial query 'What services does Black Intel of' is canonicalized in DB message and response.
+    2. Duplicate citation labels are stripped.
+    """
+    client = black_intel_client
+    res = client.post("/api/v1/public/chat", json={"message": "What services does Black Intel of"})
+    assert res.status_code == 200
+    data = res.get_json()
+    assert "cybersecurity" in data["answer"].lower() or "offense" in data["answer"].lower()
+
+    # Verify deduplicated citations
+    citations = data.get("citations", [])
+    assert len(citations) == len(set(citations)), "Citations must not contain duplicate entries"
+
+    # Verify DB stored message has canonicalized prompt
+    db = client.application.extensions["mongo_db"]
+    stored_msg = db.messages.find_one({"role": "visitor", "content": "What services does Black Intel offer?"})
+    assert stored_msg is not None, "Message must be saved in db.messages with canonicalized complete prompt"
+
+
+def test_follow_up_conversation_context_resolution(black_intel_client):
+    """
+    Verify follow-up queries like 'Tell me more about it' use prior conversation context.
+    """
+    client = black_intel_client
+    # Turn 1
+    t1 = client.post("/api/v1/public/chat", json={"message": "What does Black Intel do?"})
+    assert t1.status_code == 200
+    conv_id = t1.get_json()["conversation_id"]
+
+    # Turn 2: Follow-up
+    t2 = client.post(f"/api/v1/public/conversations/{conv_id}/messages", json={"message": "Tell me more about it"})
+    assert t2.status_code == 200
+    ans = t2.get_json()["answer"]
+    assert "cybersecurity" in ans.lower() or "intelligence" in ans.lower() or "forensics" in ans.lower()
+    assert "I do not have confirmed information" not in ans
+
+
+def test_local_code_synthesis_markdown_formatting_and_no_error_prefix(app_client):
+    """
+    Verify:
+    1. Code synthesis produces valid Markdown code blocks (```python).
+    2. 'External AI completion is currently unavailable' is never prepended to valid local solutions.
+    """
+    from app.services.llm_gateway import respond
+
+    client, tenants = app_client
+    tenant_id = str(tenants[0][1])
+
+    with client.application.app_context():
+        # Code query
+        res = respond(tenant_id, "Write a Python function to add two numbers")
+        assert res["provider"] == "local"
+        assert "```python" in res["answer"]
+        assert "def add_numbers(" in res["answer"]
+        assert "External AI completion is currently unavailable" not in res["answer"]
+
+        # Loop query
+        res_loop = respond(tenant_id, "how to write a loop in python")
+        assert res_loop["provider"] == "local"
+        assert "```python" in res_loop["answer"]
+        assert "for " in res_loop["answer"]
+        assert "External AI completion is currently unavailable" not in res_loop["answer"]
+
+        # Sorting query
+        res_sort = respond(tenant_id, "how to sort a list in Python")
+        assert res_sort["provider"] == "local"
+        assert "```python" in res_sort["answer"]
+        assert "sort" in res_sort["answer"].lower()
+        assert "External AI completion is currently unavailable" not in res_sort["answer"]

@@ -144,11 +144,13 @@ def chat(conversation_id=None):
     else:
         conversation = {"tenant_id": tenant_id, "customer_id": customer["customer_id"], "visitor_id": secrets.token_urlsafe(16), "channel": "customer_portal", "status": "open", "created_at": now(), "updated_at": now()}
         conversation["_id"] = db.conversations.insert_one(conversation).inserted_id
-    db.messages.insert_one({"tenant_id": tenant_id, "conversation_id": conversation["_id"], "role": "customer", "content": message.strip(), "created_at": now()})
+    from app.services.llm_gateway import _canonicalize_query
+    clean_message = _canonicalize_query(message.strip())
+    db.messages.insert_one({"tenant_id": tenant_id, "conversation_id": conversation["_id"], "role": "customer", "content": clean_message, "created_at": now()})
     history = list(db.messages.find({"tenant_id": tenant_id, "conversation_id": conversation["_id"]}).sort("created_at", -1).limit(8))
     answer = respond(
         str(tenant_id),
-        message.strip(),
+        clean_message,
         list(reversed(history)),
         customer_name=customer["full_name"],
     )

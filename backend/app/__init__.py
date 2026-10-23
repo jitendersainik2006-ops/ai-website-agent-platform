@@ -24,7 +24,7 @@ def create_app(config: dict | None = None, mongo_client=None) -> Flask:
         ),
         LLM_PROVIDER=os.environ.get("LLM_PROVIDER", "local").lower(),
         GEMINI_API_KEY=os.environ.get("GEMINI_API_KEY", ""),
-        GEMINI_MODEL=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
+        GEMINI_MODEL=os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
         GROQ_API_KEY=os.environ.get("GROQ_API_KEY", ""),
         GROQ_MODEL=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
         OPENAI_COMPATIBLE_API_KEY=os.environ.get("OPENAI_COMPATIBLE_API_KEY", ""),
@@ -46,12 +46,31 @@ def create_app(config: dict | None = None, mongo_client=None) -> Flask:
             "Missing required environment variables: " + ", ".join(missing_settings)
         )
 
-    mongo_client = mongo_client or MongoClient(
-        app.config["MONGODB_URI"],
-        serverSelectionTimeoutMS=app.config["MONGODB_SERVER_SELECTION_TIMEOUT_MS"],
-    )
-    app.extensions["mongo_client"] = mongo_client
-    app.extensions["mongo_db"] = mongo_client[app.config["MONGODB_DATABASE"]]
+    from app.isolated_db import is_isolated_db_enabled, setup_isolated_db, seed_isolated_db
+
+    if mongo_client is not None:
+        app.extensions["mongo_client"] = mongo_client
+        app.extensions["mongo_db"] = mongo_client[app.config["MONGODB_DATABASE"]]
+        app.extensions["is_isolated_db"] = type(mongo_client).__module__.startswith("mongomock")
+    elif is_isolated_db_enabled(app.config):
+        mongo_client, mongo_db = setup_isolated_db(app)
+        app.extensions["mongo_client"] = mongo_client
+        app.extensions["mongo_db"] = mongo_db
+        app.extensions["is_isolated_db"] = True
+        should_seed = app.config.get("SEED_DEMO_DATA")
+        if should_seed is None:
+            should_seed = not app.config.get("TESTING")
+        if should_seed:
+            seed_isolated_db(mongo_db)
+    else:
+        mongo_client = MongoClient(
+            app.config["MONGODB_URI"],
+            serverSelectionTimeoutMS=app.config["MONGODB_SERVER_SELECTION_TIMEOUT_MS"],
+        )
+        app.extensions["mongo_client"] = mongo_client
+        app.extensions["mongo_db"] = mongo_client[app.config["MONGODB_DATABASE"]]
+        app.extensions["is_isolated_db"] = False
+        logger.info("DATABASE MODE: CONFIGURED DATABASE (remote/local MongoDB URI)")
     from app.services.calendar_adapter import LocalCalendarAdapter
     from app.services.notifications import LocalNotificationProvider
 
